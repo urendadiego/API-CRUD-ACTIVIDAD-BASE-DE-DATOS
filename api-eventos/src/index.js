@@ -1,15 +1,15 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import empresasRoutes from "./routes/empresas.routes.js";
+import empresasRouter from "./routes/empresas.routes.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({ origin: process.env.FRONTEND_URL }));
 app.use(express.json());
 
-app.use("/api/empresas", empresasRoutes);
+app.use("/api/empresas", empresasRouter);
 
 // Ruta 404 para rutas inexistentes (siempre al final)
 app.use((req, res) => {

@@ -46,7 +46,7 @@ export const crearEmpresa = async (req, res) => {
       `INSERT INTO empresas (nombre, cuit, email, telefono, direccion)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
-      [nombre, cuit, email ?? null, telefono ?? null, direccion ?? null]
+      [nombre, cuit, email || null, telefono || null, direccion || null]
     );
     res.status(201).json(resultado.rows[0]);
   } catch (error) {
@@ -63,25 +63,42 @@ export const editarEmpresa = async (req, res) => {
     return res.status(400).json({ mensaje: "El id debe ser un número entero" });
   }
 
-  const { nombre, cuit, email, telefono, direccion, activo } = req.body ?? {};
-
-  // COALESCE: si un campo no se envía, se mantiene el valor actual
   try {
-    const resultado = await pool.query(
-      `UPDATE empresas SET
-         nombre = COALESCE($1, nombre),
-         cuit = COALESCE($2, cuit),
-         email = COALESCE($3, email),
-         telefono = COALESCE($4, telefono),
-         direccion = COALESCE($5, direccion),
-         activo = COALESCE($6, activo)
-       WHERE id_empresa = $7
-       RETURNING *`,
-      [nombre, cuit, email, telefono, direccion, activo, id]
+    const actual = await pool.query(
+      "SELECT * FROM empresas WHERE id_empresa = $1",
+      [id]
     );
-    if (resultado.rows.length === 0) {
+    if (actual.rows.length === 0) {
       return res.status(404).json({ mensaje: "Empresa no encontrada" });
     }
+
+    // Los campos que no vienen en el body mantienen su valor actual.
+    // Los que vienen vacíos ("" o null) se guardan como null.
+    const body = req.body ?? {};
+    const valor = (campo) => {
+      if (!(campo in body)) return actual.rows[0][campo];
+      return body[campo] === "" ? null : body[campo];
+    };
+    const empresa = {
+      nombre: valor("nombre"),
+      cuit: valor("cuit"),
+      email: valor("email"),
+      telefono: valor("telefono"),
+      direccion: valor("direccion"),
+      activo: valor("activo") ?? true
+    };
+
+    if (!empresa.nombre || !empresa.cuit) {
+      return res.status(400).json({ mensaje: "Los campos nombre y cuit no pueden quedar vacíos" });
+    }
+
+    const resultado = await pool.query(
+      `UPDATE empresas SET
+         nombre = $1, cuit = $2, email = $3, telefono = $4, direccion = $5, activo = $6
+       WHERE id_empresa = $7
+       RETURNING *`,
+      [empresa.nombre, empresa.cuit, empresa.email, empresa.telefono, empresa.direccion, empresa.activo, id]
+    );
     res.json(resultado.rows[0]);
   } catch (error) {
     if (error.code === UNIQUE_VIOLATION) {
