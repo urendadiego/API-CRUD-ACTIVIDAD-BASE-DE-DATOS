@@ -1,5 +1,5 @@
--- Crear la base primero (una sola vez):  CREATE DATABASE eventos;
--- Luego conectarse a "eventos" y ejecutar este script.
+-- Ejecutar una sola vez en la base del proyecto
+-- (en Supabase: SQL Editor -> pegar -> Run; en local: Query Tool de pgAdmin).
 
 CREATE TABLE empresas (
     id_empresa SERIAL PRIMARY KEY,

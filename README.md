@@ -9,21 +9,15 @@ En esta etapa solo existe la tabla `empresas`.
    ```bash
    npm install
    ```
-2. Crear la base de datos en PostgreSQL (pgAdmin o psql):
-   ```sql
-   CREATE DATABASE eventos;
-   ```
-   Conectarse a `eventos` y ejecutar el script [database/empresas.sql](database/empresas.sql).
-3. Copiar `.env.example` a `.env` y completar la contraseña de **su** Postgres:
+2. Crear el archivo `.env` (copiando `.env.example`) con la conexión a la base **compartida del grupo en Supabase**:
    ```
    PORT=3000
-   DB_HOST=localhost
-   DB_PORT=5432
-   DB_USER=postgres
-   DB_PASSWORD=su_contraseña
-   DB_NAME=eventos
+   DATABASE_URL=postgresql://postgres.xxxx:CONTRASEÑA@aws-1-us-west-2.pooler.supabase.com:5432/postgres
    ```
+   La `DATABASE_URL` se pide por privado al grupo (Supabase → Connect → URI → **Session pooler**).
    El `.env` **nunca** se sube a GitHub (ya está en `.gitignore`).
+3. (Opcional) Para usar un PostgreSQL local en vez de Supabase: crear una base, ejecutar
+   [database/empresas.sql](database/empresas.sql), borrar `DATABASE_URL` del `.env` y completar las variables `DB_*`.
 4. Levantar el servidor:
    ```bash
    npm run dev
@@ -65,8 +59,14 @@ Ejemplo de body para POST:
 }
 ```
 
+## Base de datos
+
+- Todo el grupo comparte **una sola base** en Supabase (la tabla `empresas` ya está creada ahí).
+  Si uno crea o borra una empresa, los demás lo ven.
+- Si `DATABASE_URL` existe, [src/data/db.js](src/data/db.js) la usa (con SSL); si no, usa las variables `DB_*`.
+- Si la URL trae `?sslmode=require` al final, sacarlo (el SSL ya lo configura `db.js`).
+
 ## Deploy (opcional)
 
-La actividad se corre en local. Si más adelante se sube a Vercel, la base tiene que estar en la nube
-(Neon, Supabase, etc.), porque Vercel no puede conectarse al Postgres de una computadora personal.
-En ese caso se define `DATABASE_URL` en las variables de entorno de Vercel y `db.js` la usa automáticamente.
+Si se sube a Vercel, se carga `DATABASE_URL` en las variables de entorno del proyecto
+(conviene la URL del **Transaction pooler**, puerto 6543).
