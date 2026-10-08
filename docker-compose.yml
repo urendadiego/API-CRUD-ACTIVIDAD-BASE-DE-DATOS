@@ -1,0 +1,100 @@
+# Infraestructura de Backstage en Docker
+#
+#   navegador ──► nginx (puerto 80, única puerta de entrada)
+#                   ├── /       → front (React compilado, archivos estáticos)
+#                   └── /api/   → balanceo round robin entre api1, api2 y api3
+#                                     └──► db (PostgreSQL, solo visible por las APIs)
+#
+# Levantar:  docker compose up -d --build
+# Ver estado: docker compose ps
+
+# Configuración común a las 3 réplicas de la API (ancla YAML para no repetirla)
+x-api: &api
+  build: ./api-eventos
+  image: api-eventos
+  restart: unless-stopped
+  environment: &api-env
+    PORT: 3000
+    # Base SQL dockerizada (servicio "db" de este archivo)
+    DB_HOST: db
+    DB_PORT: 5432
+    DB_USER: ${POSTGRES_USER}
+    DB_PASSWORD: ${POSTGRES_PASSWORD}
+    DB_NAME: ${POSTGRES_DB}
+    # Vacía = usa la base del contenedor. Con la URL de Supabase = usa la base vía web.
+    DATABASE_URL: ${DATABASE_URL:-}
+  depends_on:
+    db:
+      condition: service_healthy
+  networks:
+    - red-front
+    - red-datos
+
+services:
+  # Máquina de acceso: balanceador de carga + front
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    container_name: eventos-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api1
+      - api2
+      - api3
+    networks:
+      - red-front
+
+  # Réplicas de la API (mismo código e imagen, distinto nombre de instancia)
+  api1:
+    <<: *api
+    container_name: eventos-api1
+    environment:
+      <<: *api-env
+      INSTANCIA: api1
+
+  api2:
+    <<: *api
+    container_name: eventos-api2
+    environment:
+      <<: *api-env
+      INSTANCIA: api2
+
+  api3:
+    <<: *api
+    container_name: eventos-api3
+    environment:
+      <<: *api-env
+      INSTANCIA: api3
+
+  # Base de datos única y exclusiva: no publica puertos, solo la ven las APIs
+  db:
+    image: postgres:17-alpine
+    container_name: eventos-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - datos-postgres:/var/lib/postgresql/data
+      # Se ejecuta solo la primera vez (cuando el volumen está vacío)
+      - ./api-eventos/database/empresas.sql:/docker-entrypoint-initdb.d/01-empresas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - red-datos
+
+networks:
+  # nginx ↔ APIs
+  red-front:
+  # APIs ↔ base de datos (nginx no tiene acceso)
+  red-datos:
+
+volumes:
+  datos-postgres:
