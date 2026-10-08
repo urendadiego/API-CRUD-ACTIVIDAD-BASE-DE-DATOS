@@ -1,0 +1,4796 @@
+package sync
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Gentleman-Programming/engram/v2/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/v2/internal/store"
+	_ "modernc.org/sqlite"
+)
+
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = s.Close()
+	})
+	return s
+}
+
+func seedStoreForSync(t *testing.T, s *store.Store) {
+	t.Helper()
+
+	if err := s.CreateSession("s-proj", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session proj-a: %v", err)
+	}
+	if err := s.CreateSession("s-other", "proj-b", "/tmp/proj-b"); err != nil {
+		t.Fatalf("create session proj-b: %v", err)
+	}
+
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-proj",
+		Type:      "decision",
+		Title:     "project observation",
+		Content:   "project scoped content",
+		Project:   "proj-a",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add proj-a observation: %v", err)
+	}
+
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "s-other",
+		Type:      "decision",
+		Title:     "other observation",
+		Content:   "other scoped content",
+		Project:   "proj-b",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add proj-b observation: %v", err)
+	}
+
+	if _, err := s.AddPrompt(store.AddPromptParams{SessionID: "s-proj", Content: "prompt-a", Project: "proj-a"}); err != nil {
+		t.Fatalf("add proj-a prompt: %v", err)
+	}
+	if _, err := s.AddPrompt(store.AddPromptParams{SessionID: "s-other", Content: "prompt-b", Project: "proj-b"}); err != nil {
+		t.Fatalf("add proj-b prompt: %v", err)
+	}
+}
+
+func seedRelationForProject(t *testing.T, s *store.Store, project, sessionID, relationID string) (sourceSyncID, targetSyncID string) {
+	t.Helper()
+	if err := s.CreateSession(sessionID, project, "/tmp/"+project); err != nil {
+		t.Fatalf("create session %s: %v", sessionID, err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     project + " source",
+		Content:   project + " source content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add source observation: %v", err)
+	}
+	targetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     project + " target",
+		Content:   project + " target content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add target observation: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get source observation: %v", err)
+	}
+	target, err := s.GetObservation(targetID)
+	if err != nil {
+		t.Fatalf("get target observation: %v", err)
+	}
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: target.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	reason := "deterministic test relation"
+	confidence := 0.95
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Reason:        &reason,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+	return source.SyncID, target.SyncID
+}
+
+func seedRelationWithSessionInheritedProject(t *testing.T, s *store.Store, project, sessionID, relationID string) (sourceSyncID, targetSyncID string) {
+	t.Helper()
+	if err := s.CreateSession(sessionID, project, "/tmp/"+project); err != nil {
+		t.Fatalf("create session %s: %v", sessionID, err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     project + " inherited source",
+		Content:   project + " inherited source content",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add inherited source observation: %v", err)
+	}
+	targetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     project + " inherited target",
+		Content:   project + " inherited target content",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add inherited target observation: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get inherited source observation: %v", err)
+	}
+	target, err := s.GetObservation(targetID)
+	if err != nil {
+		t.Fatalf("get inherited target observation: %v", err)
+	}
+	if source.Project == nil || *source.Project != project || target.Project == nil || *target.Project != project {
+		t.Fatalf("expected observations to inherit project %q from session, got source=%v target=%v", project, source.Project, target.Project)
+	}
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: target.SyncID}); err != nil {
+		t.Fatalf("save inherited relation: %v", err)
+	}
+	reason := "deterministic inherited project relation"
+	confidence := 0.95
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Reason:        &reason,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge inherited relation: %v", err)
+	}
+	return source.SyncID, target.SyncID
+}
+
+func writeManifestFile(t *testing.T, dir string, m *Manifest) {
+	t.Helper()
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sync dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+func writeLocalChunkFile(t *testing.T, dir, id string, chunk ChunkData) {
+	t.Helper()
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal chunk %s: %v", id, err)
+	}
+	chunksDir := filepath.Join(dir, "chunks")
+	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	if err := writeGzip(filepath.Join(chunksDir, id+".jsonl.gz"), payload); err != nil {
+		t.Fatalf("write gzip chunk %s: %v", id, err)
+	}
+}
+
+func resetSyncTestHooks(t *testing.T) {
+	t.Helper()
+	origJSONMarshalChunk := jsonMarshalChunk
+	origJSONMarshalManifest := jsonMarshalManifest
+	origOSCreateFile := osCreateFile
+	origGzipWriterFactory := gzipWriterFactory
+	origOSHostname := osHostname
+	origStoreGetSynced := storeGetSynced
+	origStoreExportData := storeExportData
+	origStoreExportDataForProject := storeExportDataForProject
+	origStoreExportRelations := storeExportRelations
+	origStoreListMutationsAfterSeq := storeListMutationsAfterSeq
+	origStoreAckMutationSeq := storeAckMutationSeq
+	origStoreApplyPulledChunk := storeApplyPulledChunk
+	origStoreRecordSynced := storeRecordSynced
+
+	t.Cleanup(func() {
+		jsonMarshalChunk = origJSONMarshalChunk
+		jsonMarshalManifest = origJSONMarshalManifest
+		osCreateFile = origOSCreateFile
+		gzipWriterFactory = origGzipWriterFactory
+		osHostname = origOSHostname
+		storeGetSynced = origStoreGetSynced
+		storeExportData = origStoreExportData
+		storeExportDataForProject = origStoreExportDataForProject
+		storeExportRelations = origStoreExportRelations
+		storeListMutationsAfterSeq = origStoreListMutationsAfterSeq
+		storeAckMutationSeq = origStoreAckMutationSeq
+		storeApplyPulledChunk = origStoreApplyPulledChunk
+		storeRecordSynced = origStoreRecordSynced
+	})
+}
+
+type fakeGzipWriter struct {
+	writeErr error
+	closeErr error
+}
+
+type fakeCloudTransport struct {
+	manifest           *Manifest
+	chunks             map[string][]byte
+	lastCreatedBy      string
+	readChunkErr       error
+	writeManifestErr   error
+	readManifestCalls  int
+	writeManifestCalls int
+	writeChunkCalls    int
+	readChunkCalls     int
+}
+
+type fakeUpgradeHooks struct {
+	stopCalls   int
+	resumeCalls int
+	stopErr     error
+	resumeErr   error
+}
+
+func (h *fakeUpgradeHooks) StopForUpgrade(_ string) error {
+	h.stopCalls++
+	return h.stopErr
+}
+
+func (h *fakeUpgradeHooks) ResumeAfterUpgrade(_ string) error {
+	h.resumeCalls++
+	return h.resumeErr
+}
+
+func newFakeCloudTransport() *fakeCloudTransport {
+	return &fakeCloudTransport{
+		manifest: &Manifest{Version: 1},
+		chunks:   map[string][]byte{},
+	}
+}
+
+func (f *fakeCloudTransport) ReadManifest() (*Manifest, error) {
+	f.readManifestCalls++
+	return f.manifest, nil
+}
+
+func (f *fakeCloudTransport) WriteManifest(m *Manifest) error {
+	f.writeManifestCalls++
+	if f.writeManifestErr != nil {
+		return f.writeManifestErr
+	}
+	f.manifest = m
+	return nil
+}
+
+func (f *fakeCloudTransport) WriteChunk(chunkID string, data []byte, entry ChunkEntry) error {
+	f.writeChunkCalls++
+	f.chunks[chunkID] = data
+	f.lastCreatedBy = entry.CreatedBy
+	return nil
+}
+
+type mutableUpgradeHooks struct {
+	stopCalls   int
+	resumeCalls int
+	stopErr     error
+	resumeErr   error
+	onStop      func()
+}
+
+func (h *mutableUpgradeHooks) StopForUpgrade(_ string) error {
+	h.stopCalls++
+	if h.onStop != nil {
+		h.onStop()
+	}
+	return h.stopErr
+}
+
+func (h *mutableUpgradeHooks) ResumeAfterUpgrade(_ string) error {
+	h.resumeCalls++
+	return h.resumeErr
+}
+
+func (f *fakeCloudTransport) ReadChunk(chunkID string) ([]byte, error) {
+	f.readChunkCalls++
+	if f.readChunkErr != nil {
+		return nil, f.readChunkErr
+	}
+	data, ok := f.chunks[chunkID]
+	if !ok {
+		return nil, ErrChunkNotFound
+	}
+	return data, nil
+}
+
+func (f *fakeGzipWriter) Write(_ []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return 1, nil
+}
+
+func (f *fakeGzipWriter) Close() error {
+	return f.closeErr
+}
+
+func TestNew(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	sy := New(s, syncDir)
+
+	if sy == nil {
+		t.Fatal("expected non-nil syncer")
+	}
+	if sy.store != s {
+		t.Fatal("store pointer not preserved")
+	}
+	if sy.syncDir != syncDir {
+		t.Fatalf("sync dir mismatch: got %q want %q", sy.syncDir, syncDir)
+	}
+}
+
+func TestImportWithProgressReportsOnlyCommittedChunks(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: ownershipModeManifestVersion, Chunks: []ChunkEntry{
+		{ID: "observation-first"},
+		{ID: "session-second"},
+	}}
+	project := "proj-a"
+	observation, err := json.Marshal(ChunkData{Observations: []store.Observation{{
+		SyncID: "obs-progress", SessionID: "sess-progress", Type: "note", Title: "progress", Content: "waits for session", Project: &project, Scope: "project",
+	}}})
+	if err != nil {
+		t.Fatalf("marshal observation chunk: %v", err)
+	}
+	session, err := json.Marshal(ChunkData{Sessions: []store.Session{{
+		ID: "sess-progress", Project: "proj-a", Directory: "/tmp/proj-a", StartedAt: "2026-01-01 00:00:00",
+	}}})
+	if err != nil {
+		t.Fatalf("marshal session chunk: %v", err)
+	}
+	transport.chunks["observation-first"] = observation
+	transport.chunks["session-second"] = session
+
+	var snapshots []ImportProgress
+	result, err := NewCloudWithTransport(dst, transport, "proj-a").ImportWithProgress(func(progress ImportProgress) {
+		snapshots = append(snapshots, progress)
+	})
+	if err != nil {
+		t.Fatalf("import with progress: %v", err)
+	}
+	if result.ChunksImported != 2 {
+		t.Fatalf("imported chunks = %d, want 2", result.ChunksImported)
+	}
+	if transport.readChunkCalls != 3 {
+		t.Fatalf("chunk reads = %d, want failed dependency attempt plus two commits", transport.readChunkCalls)
+	}
+	want := []ImportProgress{
+		{LocalChunks: 0, RemoteChunks: 2, PendingChunks: 2, Percentage: 0},
+		{LocalChunks: 1, RemoteChunks: 2, PendingChunks: 1, Percentage: 50},
+		{LocalChunks: 2, RemoteChunks: 2, PendingChunks: 0, Percentage: 100},
+	}
+	if !reflect.DeepEqual(snapshots, want) {
+		t.Fatalf("progress snapshots = %#v, want %#v", snapshots, want)
+	}
+}
+
+func TestImportWithProgressReportsCompletedNoOp(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: ownershipModeManifestVersion}
+	var snapshots []ImportProgress
+	result, err := NewCloudWithTransport(dst, transport, "proj-a").ImportWithProgress(func(progress ImportProgress) {
+		snapshots = append(snapshots, progress)
+	})
+	if err != nil {
+		t.Fatalf("no-op import with progress: %v", err)
+	}
+	if result.ChunksImported != 0 {
+		t.Fatalf("imported chunks = %d, want 0", result.ChunksImported)
+	}
+	want := []ImportProgress{
+		{LocalChunks: 0, RemoteChunks: 0, PendingChunks: 0, Percentage: 100},
+		{LocalChunks: 0, RemoteChunks: 0, PendingChunks: 0, Percentage: 100},
+	}
+	if !reflect.DeepEqual(snapshots, want) {
+		t.Fatalf("progress snapshots = %#v, want %#v", snapshots, want)
+	}
+}
+
+func TestExportImportFlowWithProjectFilter(t *testing.T) {
+	srcStore := newTestStore(t)
+	seedStoreForSync(t, srcStore)
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	exporter := New(srcStore, syncDir)
+
+	exportResult, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if exportResult.IsEmpty {
+		t.Fatal("expected non-empty export")
+	}
+	if exportResult.SessionsExported != 1 || exportResult.ObservationsExported != 1 || exportResult.PromptsExported != 1 {
+		t.Fatalf("unexpected export counts: %+v", exportResult)
+	}
+
+	chunkPath := filepath.Join(syncDir, "chunks", exportResult.ChunkID+".jsonl.gz")
+	if _, err := os.Stat(chunkPath); err != nil {
+		t.Fatalf("chunk file missing: %v", err)
+	}
+
+	manifest, err := exporter.readManifest()
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if len(manifest.Chunks) != 1 || manifest.Chunks[0].ID != exportResult.ChunkID {
+		t.Fatalf("unexpected manifest after export: %+v", manifest.Chunks)
+	}
+
+	secondExport, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if !secondExport.IsEmpty {
+		t.Fatalf("expected second export to be empty, got %+v", secondExport)
+	}
+
+	dstStore := newTestStore(t)
+	importer := New(dstStore, syncDir)
+
+	importResult, err := importer.Import()
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if importResult.ChunksImported != 1 || importResult.ChunksSkipped != 0 {
+		t.Fatalf("unexpected chunk import counts: %+v", importResult)
+	}
+	if importResult.SessionsImported != 1 || importResult.ObservationsImported != 1 || importResult.PromptsImported != 1 {
+		t.Fatalf("unexpected imported row counts: %+v", importResult)
+	}
+
+	importAgain, err := importer.Import()
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if importAgain.ChunksImported != 0 || importAgain.ChunksSkipped != 1 {
+		t.Fatalf("unexpected second import result: %+v", importAgain)
+	}
+
+	dstData, err := dstStore.Export()
+	if err != nil {
+		t.Fatalf("export destination data: %v", err)
+	}
+	if len(dstData.Sessions) != 1 || dstData.Sessions[0].Project != "proj-a" {
+		t.Fatalf("unexpected destination sessions: %+v", dstData.Sessions)
+	}
+}
+
+func TestLocalChunkExportIncludesProjectRelations(t *testing.T) {
+	s := newTestStore(t)
+	seedRelationForProject(t, s, "proj-a", "sess-rel-a", "rel-proj-a")
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected relation export to create a chunk")
+	}
+
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	if len(chunk.Mutations) != 1 {
+		t.Fatalf("expected one relation mutation, got %+v", chunk.Mutations)
+	}
+	mutation := chunk.Mutations[0]
+	if mutation.Entity != store.SyncEntityRelation || mutation.EntityKey != "rel-proj-a" || mutation.Op != store.SyncOpUpsert {
+		t.Fatalf("unexpected relation mutation: %+v", mutation)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal relation payload: %v", err)
+	}
+	if payload["project"] != "proj-a" || payload["relation"] != store.RelationCompatible {
+		t.Fatalf("unexpected relation payload: %+v", payload)
+	}
+}
+
+func TestLocalChunkExportIncludesRelationsForObservationsInheritingSessionProject(t *testing.T) {
+	s := newTestStore(t)
+	seedRelationWithSessionInheritedProject(t, s, "proj-a", "sess-rel-inherited", "rel-inherited-proj-a")
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected inherited project relation export to create a chunk")
+	}
+
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	if len(chunk.Observations) != 2 {
+		t.Fatalf("expected project export to include inherited observations, got %+v", chunk.Observations)
+	}
+	if len(chunk.Mutations) != 1 {
+		t.Fatalf("expected one inherited project relation mutation, got %+v", chunk.Mutations)
+	}
+	mutation := chunk.Mutations[0]
+	if mutation.Entity != store.SyncEntityRelation || mutation.EntityKey != "rel-inherited-proj-a" || mutation.Project != "proj-a" {
+		t.Fatalf("unexpected inherited project relation mutation: %+v", mutation)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal relation payload: %v", err)
+	}
+	if payload["project"] != "proj-a" || payload["relation"] != store.RelationCompatible {
+		t.Fatalf("unexpected inherited project relation payload: %+v", payload)
+	}
+}
+
+func TestLocalChunkExportIncludesRelationWithMutationOnlyPriorEndpoint(t *testing.T) {
+	s := newTestStore(t)
+	const (
+		project   = "proj-a"
+		sessionID = "sess-relation-closure"
+	)
+	if err := s.CreateSession(sessionID, project, "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	targetID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "second project endpoint",
+		Content:   "second project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add second project endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	target, err := s.GetObservation(targetID)
+	if err != nil {
+		t.Fatalf("get second project endpoint: %v", err)
+	}
+
+	const oldTime = "2025-01-01 00:00:00"
+	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, oldTime, sessionID); err != nil {
+		t.Fatalf("backdate session: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE sync_id IN (?, ?)`, oldTime, oldTime, source.SyncID, target.SyncID); err != nil {
+		t.Fatalf("backdate endpoints: %v", err)
+	}
+	const relationID = "rel-watermark-closure"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: target.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE memory_relations SET created_at = ?, updated_at = ? WHERE sync_id = ?`, oldTime, oldTime, relationID); err != nil {
+		t.Fatalf("backdate relation: %v", err)
+	}
+	targetPayload, err := json.Marshal(target)
+	if err != nil {
+		t.Fatalf("marshal target endpoint: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "previous-chunk", ChunkData{
+		Sessions:     []store.Session{{ID: sessionID, Project: project, Directory: "/tmp/proj-a", StartedAt: oldTime}},
+		Observations: []store.Observation{*source},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: target.SyncID,
+			Op:        store.SyncOpUpsert,
+			Payload:   string(targetPayload),
+		}},
+	})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{
+		ID: "previous-chunk", CreatedAt: "2025-06-01T00:00:00Z",
+	}}})
+
+	result, err := New(s, syncDir).Export("alice", project)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected pre-watermark relation with historical mutation endpoint to export")
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	foundRelation := false
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			foundRelation = true
+		}
+	}
+	if !foundRelation {
+		t.Fatalf("relation with prior mutation endpoint was not exported: %+v", chunk.Mutations)
+	}
+	for _, observation := range chunk.Observations {
+		if observation.SyncID == source.SyncID || observation.SyncID == target.SyncID {
+			t.Fatalf("prior-chunk endpoint must not be re-exported for relation closure: %+v", observation)
+		}
+	}
+}
+
+func TestFilterRelationMutationsForEndpointAvailability(t *testing.T) {
+	mutation := store.SyncMutation{
+		Entity:    store.SyncEntityRelation,
+		EntityKey: "rel-endpoint-availability",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"source_id":"source","target_id":"target"}`,
+	}
+	projectEndpoints := []store.Observation{{SyncID: "source", Scope: "project"}, {SyncID: "target", Scope: "project"}}
+	bothEndpoints := map[string]struct{}{"source": {}, "target": {}}
+
+	for _, tc := range []struct {
+		name         string
+		observations []store.Observation
+		exported     map[string]struct{}
+		wantRetained bool
+	}{
+		{name: "prior project endpoints", observations: projectEndpoints, exported: bothEndpoints, wantRetained: true},
+		{name: "personal endpoint", observations: []store.Observation{{SyncID: "source", Scope: "project"}, {SyncID: "target", Scope: "personal"}}, exported: bothEndpoints},
+		{name: "out of project endpoint", observations: []store.Observation{{SyncID: "source", Scope: "project"}}, exported: bothEndpoints},
+		{name: "never delivered endpoint", observations: projectEndpoints, exported: map[string]struct{}{"source": {}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunk := &ChunkData{Mutations: []store.SyncMutation{mutation}}
+			if err := filterRelationMutationsForEndpointAvailability(chunk, &store.ExportData{Observations: tc.observations}, tc.exported, true); err != nil {
+				t.Fatalf("filter relation endpoints: %v", err)
+			}
+			if got := len(chunk.Mutations); (got == 1) != tc.wantRetained {
+				t.Fatalf("retained %d relation mutations, want retained=%t", got, tc.wantRetained)
+			}
+		})
+	}
+}
+
+func TestLocalChunkExportSkipsRelationWithPersonalEndpoint(t *testing.T) {
+	s := newTestStore(t)
+	const (
+		project   = "proj-a"
+		sessionID = "sess-personal-relation-endpoint"
+	)
+	if err := s.CreateSession(sessionID, project, "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   project,
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	personalID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "personal endpoint",
+		Content:   "personal endpoint content",
+		Project:   project,
+		Scope:     "personal",
+	})
+	if err != nil {
+		t.Fatalf("add personal endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	personal, err := s.GetObservation(personalID)
+	if err != nil {
+		t.Fatalf("get personal endpoint: %v", err)
+	}
+
+	const oldTime = "2025-01-01 00:00:00"
+	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, oldTime, sessionID); err != nil {
+		t.Fatalf("backdate session: %v", err)
+	}
+	if _, err := s.DB().Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE sync_id = ?`, oldTime, oldTime, source.SyncID); err != nil {
+		t.Fatalf("backdate project endpoint: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "new project observation",
+		Content:   "new project observation content",
+		Project:   project,
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add new project observation: %v", err)
+	}
+
+	const relationID = "rel-personal-endpoint"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: personal.SyncID, TargetID: source.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "previous-chunk", ChunkData{})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{
+		ID: "previous-chunk", CreatedAt: "2025-06-01T00:00:00Z",
+	}}})
+
+	result, err := New(s, syncDir).Export("alice", project)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			t.Fatalf("personal endpoint relation must not be exported: %+v", mutation)
+		}
+	}
+	for _, observation := range chunk.Observations {
+		if observation.SyncID == personal.SyncID {
+			t.Fatalf("personal endpoint must not be added for relation closure: %+v", observation)
+		}
+	}
+}
+
+func TestLocalChunkExportIncludesRelationWithPersonalEndpointInFullExport(t *testing.T) {
+	s := newTestStore(t)
+	const sessionID = "sess-full-personal-relation-endpoint"
+	if err := s.CreateSession(sessionID, "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sourceID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "project endpoint",
+		Content:   "project endpoint content",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add project endpoint: %v", err)
+	}
+	personalID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: sessionID,
+		Type:      "decision",
+		Title:     "personal endpoint",
+		Content:   "personal endpoint content",
+		Project:   "proj-a",
+		Scope:     "personal",
+	})
+	if err != nil {
+		t.Fatalf("add personal endpoint: %v", err)
+	}
+	source, err := s.GetObservation(sourceID)
+	if err != nil {
+		t.Fatalf("get project endpoint: %v", err)
+	}
+	personal, err := s.GetObservation(personalID)
+	if err != nil {
+		t.Fatalf("get personal endpoint: %v", err)
+	}
+
+	const relationID = "rel-full-personal-endpoint"
+	if _, err := s.SaveRelation(store.SaveRelationParams{SyncID: relationID, SourceID: source.SyncID, TargetID: personal.SyncID}); err != nil {
+		t.Fatalf("save relation: %v", err)
+	}
+	confidence := 0.9
+	if _, err := s.JudgeRelation(store.JudgeRelationParams{
+		JudgmentID:    relationID,
+		Relation:      store.RelationCompatible,
+		Confidence:    &confidence,
+		MarkedByActor: "test",
+		MarkedByKind:  "system",
+	}); err != nil {
+		t.Fatalf("judge relation: %v", err)
+	}
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	result, err := New(s, syncDir).Export("alice", "")
+	if err != nil {
+		t.Fatalf("full export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+
+	observations := map[string]bool{}
+	for _, observation := range chunk.Observations {
+		observations[observation.SyncID] = true
+	}
+	if !observations[source.SyncID] || !observations[personal.SyncID] {
+		t.Fatalf("expected both relation endpoints in full export, got %+v", chunk.Observations)
+	}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation && mutation.EntityKey == relationID {
+			return
+		}
+	}
+	t.Fatalf("relation with personal endpoint was not exported: %+v", chunk.Mutations)
+}
+
+func TestLocalChunkExportRejectsMalformedRelationEndpointPayload(t *testing.T) {
+	originalExportRelations := storeExportRelations
+	t.Cleanup(func() { storeExportRelations = originalExportRelations })
+	storeExportRelations = func(_ *store.Store, _ string) ([]store.SyncMutation, error) {
+		return []store.SyncMutation{{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-malformed",
+			Op:        store.SyncOpUpsert,
+			Payload:   "{",
+		}}, nil
+	}
+
+	_, err := New(newTestStore(t), filepath.Join(t.TempDir(), ".engram")).Export("alice", "proj-a")
+	if err == nil || !strings.Contains(err.Error(), "filter relation endpoints: decode relation rel-malformed") {
+		t.Fatalf("expected malformed relation payload error, got %v", err)
+	}
+}
+
+func TestLocalChunkImportRestoresRelationsAfterObservations(t *testing.T) {
+	src := newTestStore(t)
+	sourceSyncID, targetSyncID := seedRelationForProject(t, src, "proj-a", "sess-rel-import", "rel-import")
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	if _, err := New(src, syncDir).Export("alice", "proj-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	dst := newTestStore(t)
+	result, err := New(dst, syncDir).Import()
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.ChunksImported != 1 || result.ObservationsImported != 2 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	relation, err := dst.GetRelation("rel-import")
+	if err != nil {
+		t.Fatalf("get imported relation: %v", err)
+	}
+	if relation.SourceID != sourceSyncID || relation.TargetID != targetSyncID || relation.Relation != store.RelationCompatible {
+		t.Fatalf("unexpected imported relation: %+v", relation)
+	}
+
+	importAgain, err := New(dst, syncDir).Import()
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if importAgain.ChunksImported != 0 || importAgain.ChunksSkipped != 1 {
+		t.Fatalf("unexpected second import result: %+v", importAgain)
+	}
+	relationAgain, err := dst.GetRelation("rel-import")
+	if err != nil {
+		t.Fatalf("get relation after second import: %v", err)
+	}
+	if relationAgain.SourceID != sourceSyncID || relationAgain.TargetID != targetSyncID || relationAgain.Relation != store.RelationCompatible {
+		t.Fatalf("unexpected relation after second import: %+v", relationAgain)
+	}
+}
+
+func TestLocalChunkImportOldChunkWithoutRelationsStillWorks(t *testing.T) {
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	chunkID := "oldchunk"
+	writeLocalChunkFile(t, syncDir, chunkID, ChunkData{
+		Sessions: []store.Session{{ID: "sess-old", Project: "proj-a", Directory: "/tmp/proj-a", StartedAt: "2025-01-01 00:00:00"}},
+		Observations: []store.Observation{{
+			SyncID:    "obs-old",
+			SessionID: "sess-old",
+			Type:      "decision",
+			Title:     "old chunk observation",
+			Content:   "old chunk content",
+			Scope:     "project",
+			CreatedAt: "2025-01-01 00:00:01",
+			UpdatedAt: "2025-01-01 00:00:01",
+		}},
+	})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedBy: "legacy", CreatedAt: "2025-01-01T00:00:00Z", Sessions: 1, Memories: 1}}})
+
+	result, err := New(newTestStore(t), syncDir).Import()
+	if err != nil {
+		t.Fatalf("import old chunk: %v", err)
+	}
+	if result.ChunksImported != 1 || result.SessionsImported != 1 || result.ObservationsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+}
+
+func TestLocalChunkExportExcludesOtherProjectRelations(t *testing.T) {
+	s := newTestStore(t)
+	seedRelationForProject(t, s, "proj-a", "sess-rel-a", "rel-proj-a")
+	seedRelationForProject(t, s, "proj-b", "sess-rel-b", "rel-proj-b")
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+	got := []string{}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity == store.SyncEntityRelation {
+			got = append(got, mutation.EntityKey)
+		}
+	}
+	if len(got) != 1 || got[0] != "rel-proj-a" {
+		t.Fatalf("expected only proj-a relation, got %v", got)
+	}
+}
+
+// TestIncrementalRelationExport verifies that successive exports only carry new
+// relation mutations in each chunk and that a third export with no new data
+// produces an empty (IsEmpty) result.
+//
+// Timing is controlled explicitly: rel-inc-1 is backdated to 2025-01-01, the
+// manifest records the first chunk at 2025-06-01 (after rel-inc-1), and
+// rel-inc-2 is seeded after the manifest is written so its updated_at is a
+// real "now" timestamp strictly after the manifest's CreatedAt.
+func TestIncrementalRelationExport(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+
+	// Seed rel-inc-1 with an explicit past updated_at so the time filter places
+	// it before the simulated "last chunk" time.
+	seedRelationForProject(t, s, "proj-a", "sess-inc-1", "rel-inc-1")
+	if _, err := s.DB().Exec(
+		`UPDATE memory_relations SET updated_at='2025-01-01 00:00:00', created_at='2025-01-01 00:00:00' WHERE sync_id='rel-inc-1'`,
+	); err != nil {
+		t.Fatalf("backdate rel-inc-1: %v", err)
+	}
+
+	// Write a prior chunk that genuinely CONTAINS rel-inc-1 as a relation
+	// mutation — that is what "already exported" actually means. Its CreatedAt
+	// (2025-06-01) sits between the backdated relation (2025-01-01) and "now",
+	// so the export must skip rel-inc-1 (present and not updated) and carry only
+	// rel-inc-2 (absent from every chunk).
+	chunksDir := filepath.Join(syncDir, "chunks")
+	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	pastChunkID := "pastchunk00"
+	writeLocalChunkFile(t, syncDir, pastChunkID, ChunkData{
+		// rel-inc-1 is genuinely present in this prior chunk, so
+		// Exported relation keys treat it as already exported and skip it.
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-inc-1",
+			Op:        store.SyncOpUpsert,
+		}},
+	})
+	writeManifestFile(t, syncDir, &Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: pastChunkID, CreatedBy: "alice", CreatedAt: "2025-06-01T00:00:00Z"}},
+	})
+
+	// Seed rel-inc-2 now so its updated_at is the real current time (after 2025-06-01).
+	seedRelationForProject(t, s, "proj-a", "sess-inc-2", "rel-inc-2")
+
+	// First export in this test — should carry ONLY rel-inc-2 (rel-inc-1 is before cutoff).
+	result1, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if result1.IsEmpty {
+		t.Fatal("expected export to produce a chunk with rel-inc-2")
+	}
+
+	chunkJSON1, err := readGzip(filepath.Join(syncDir, "chunks", result1.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk1 ChunkData
+	if err := json.Unmarshal(chunkJSON1, &chunk1); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+
+	// Only the new relation must appear.
+	if len(chunk1.Mutations) != 1 || chunk1.Mutations[0].EntityKey != "rel-inc-2" {
+		t.Fatalf("expected only rel-inc-2 in chunk, got %+v", chunk1.Mutations)
+	}
+	for _, m := range chunk1.Mutations {
+		if m.EntityKey == "rel-inc-1" {
+			t.Fatal("previously-exported rel-inc-1 must NOT appear in incremental chunk")
+		}
+	}
+
+	// Second export — no new data — must be empty (IsEmpty guard against double-export).
+	result2, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if !result2.IsEmpty {
+		t.Fatal("expected second export (no new data) to be empty")
+	}
+}
+
+// TestLocalChunkExportBackfillsRelationsCreatedBeforeLastChunk reproduces the
+// upgrade/backfill gap from issue #353: relations that already existed before
+// relation-sync shipped (so they were never written into any prior chunk) have
+// an updated_at older than the latest chunk. The time-only incremental filter
+// treats them as "already exported" and silently drops them, even though no
+// chunk actually contains them.
+//
+// Expected behavior: a relation absent from every prior chunk must be exported
+// regardless of its timestamp. On current code this fails (zero relations).
+func TestLocalChunkExportBackfillsRelationsCreatedBeforeLastChunk(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+
+	// Seed a relation, then backdate it so it predates the latest chunk —
+	// exactly the state of a project that judged relations before 1.16.3.
+	seedRelationForProject(t, s, "proj-a", "sess-backfill", "rel-backfill")
+	if _, err := s.DB().Exec(
+		`UPDATE memory_relations SET updated_at='2025-01-01 00:00:00', created_at='2025-01-01 00:00:00' WHERE sync_id='rel-backfill'`,
+	); err != nil {
+		t.Fatalf("backdate rel-backfill: %v", err)
+	}
+
+	// A prior chunk dated AFTER the relation but which does NOT contain it
+	// (observations were synced before relation-sync existed). This is the
+	// crucial difference from a genuinely already-exported relation.
+	chunksDir := filepath.Join(syncDir, "chunks")
+	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	writeLocalChunkFile(t, syncDir, "pastchunk00", ChunkData{})
+	writeManifestFile(t, syncDir, &Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: "pastchunk00", CreatedBy: "alice", CreatedAt: "2025-06-01T00:00:00Z"}},
+	})
+
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected export to backfill the pre-existing relation, got empty result")
+	}
+
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+
+	found := false
+	for _, m := range chunk.Mutations {
+		if m.EntityKey == "rel-backfill" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pre-existing relation rel-backfill absent from every chunk must be exported, got mutations %+v", chunk.Mutations)
+	}
+}
+
+// TestLocalChunkExportFailsLoudlyOnCorruptPriorChunk pins the new failure mode
+// introduced by reading prior chunks during export: a chunk file that exists
+// but cannot be decoded is a real fault and must fail loudly, never be skipped.
+// Skipping it would treat its relations as un-exported and could re-introduce a
+// drop on a later prune — the opposite of the "no silent drops" invariant.
+func TestLocalChunkExportFailsLoudlyOnCorruptPriorChunk(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	seedRelationForProject(t, s, "proj-a", "sess-corrupt", "rel-corrupt")
+
+	chunksDir := filepath.Join(syncDir, "chunks")
+	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	corruptID := "corruptchunk"
+	if err := os.WriteFile(filepath.Join(chunksDir, corruptID+".jsonl.gz"), []byte("not a gzip stream"), 0o644); err != nil {
+		t.Fatalf("write corrupt chunk: %v", err)
+	}
+	writeManifestFile(t, syncDir, &Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: corruptID, CreatedBy: "alice", CreatedAt: "2025-06-01T00:00:00Z"}},
+	})
+
+	if _, err := New(s, syncDir).Export("alice", "proj-a"); err == nil {
+		t.Fatal("expected Export to fail loudly on a corrupt prior chunk, got nil error")
+	}
+}
+
+func TestLocalChunkExportUsesObservationHistory(t *testing.T) {
+	tests := []struct {
+		name               string
+		history            func(store.Observation) ChunkData
+		observationCreated string
+		observationUpdated string
+		wantObservation    bool
+		wantEmpty          bool
+	}{
+		{
+			name: "older observation absent from history bypasses global watermark",
+			history: func(_ store.Observation) ChunkData {
+				return ChunkData{}
+			},
+			observationUpdated: "2025-01-01 00:00:00",
+			wantObservation:    true,
+		},
+		{
+			name: "older observation in a direct historical row remains filtered",
+			history: func(observation store.Observation) ChunkData {
+				return ChunkData{Observations: []store.Observation{{SyncID: observation.SyncID}}}
+			},
+			observationUpdated: "2025-01-01 00:00:00",
+			wantEmpty:          true,
+		},
+		{
+			name: "observation tombstone mutation counts as historical presence",
+			history: func(observation store.Observation) ChunkData {
+				return ChunkData{Mutations: []store.SyncMutation{{
+					Entity:    store.SyncEntityObservation,
+					EntityKey: observation.SyncID,
+					Op:        store.SyncOpDelete,
+				}}}
+			},
+			observationUpdated: "2025-01-01 00:00:00",
+			wantEmpty:          true,
+		},
+		{
+			name: "newer observation still exports after historical presence",
+			history: func(observation store.Observation) ChunkData {
+				return ChunkData{Observations: []store.Observation{{SyncID: observation.SyncID}}}
+			},
+			observationUpdated: "2025-07-01 00:00:00",
+			wantObservation:    true,
+		},
+		{
+			name: "observation created after watermark still exports after historical presence",
+			history: func(observation store.Observation) ChunkData {
+				return ChunkData{Observations: []store.Observation{{SyncID: observation.SyncID}}}
+			},
+			observationCreated: "2025-07-01 00:00:00",
+			observationUpdated: "2025-07-01 00:00:00",
+			wantObservation:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			const sessionID = "session-observation-history"
+			if err := s.CreateSession(sessionID, "proj-a", "/tmp/proj-a"); err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			observationID, err := s.AddObservation(store.AddObservationParams{
+				SessionID: sessionID,
+				Type:      "decision",
+				Title:     "observation history",
+				Content:   "observation history",
+				Project:   "proj-a",
+				Scope:     "project",
+			})
+			if err != nil {
+				t.Fatalf("add observation: %v", err)
+			}
+			promptID, err := s.AddPrompt(store.AddPromptParams{SessionID: sessionID, Content: "prompt history", Project: "proj-a"})
+			if err != nil {
+				t.Fatalf("add prompt: %v", err)
+			}
+			if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, "2025-01-01 00:00:00", sessionID); err != nil {
+				t.Fatalf("backdate session: %v", err)
+			}
+			observationCreated := tc.observationCreated
+			if observationCreated == "" {
+				observationCreated = "2025-01-01 00:00:00"
+			}
+			if _, err := s.DB().Exec(`UPDATE observations SET created_at = ?, updated_at = ? WHERE id = ?`, observationCreated, tc.observationUpdated, observationID); err != nil {
+				t.Fatalf("backdate observation: %v", err)
+			}
+			if _, err := s.DB().Exec(`UPDATE user_prompts SET created_at = ? WHERE id = ?`, "2025-01-01 00:00:00", promptID); err != nil {
+				t.Fatalf("backdate prompt: %v", err)
+			}
+
+			observation, err := s.GetObservation(observationID)
+			if err != nil {
+				t.Fatalf("get observation: %v", err)
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "history", tc.history(*observation))
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{
+				ID: "history", CreatedAt: "2025-06-01T00:00:00Z",
+			}}})
+
+			result, err := New(s, syncDir).Export("alice", "proj-a")
+			if err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			if result.IsEmpty != tc.wantEmpty {
+				t.Fatalf("empty export = %t, want %t", result.IsEmpty, tc.wantEmpty)
+			}
+			if got := result.SessionsExported; got != boolToInt(tc.wantObservation) {
+				t.Fatalf("exported sessions = %d, want %d", got, boolToInt(tc.wantObservation))
+			}
+			if result.IsEmpty {
+				return
+			}
+
+			payload, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+			if err != nil {
+				t.Fatalf("read export chunk: %v", err)
+			}
+			var exported ChunkData
+			if err := json.Unmarshal(payload, &exported); err != nil {
+				t.Fatalf("unmarshal export chunk: %v", err)
+			}
+			if got := len(exported.Observations); got != boolToInt(tc.wantObservation) {
+				t.Fatalf("exported observations = %d, want %d; chunk=%+v", got, boolToInt(tc.wantObservation), exported)
+			}
+			if got := len(exported.Sessions); got != boolToInt(tc.wantObservation) {
+				t.Fatalf("exported sessions = %d, want %d; chunk=%+v", got, boolToInt(tc.wantObservation), exported)
+			}
+			if exported.Sessions[0].ID != sessionID {
+				t.Fatalf("exported session = %q, want parent %q", exported.Sessions[0].ID, sessionID)
+			}
+			if len(exported.Prompts) != 0 {
+				t.Fatalf("old prompts must retain timestamp filtering: %+v", exported)
+			}
+		})
+	}
+}
+
+func TestLocalChunkExportConvergesAfterImportingHistoricalTombstone(t *testing.T) {
+	const (
+		sessionID = "session-historical-tombstone"
+		obsSyncID = "observation-historical-tombstone"
+		createdAt = "2025-01-01 00:00:00"
+		deletedAt = "2025-02-01 00:00:00"
+	)
+	tombstoneDeletedAt := deletedAt
+
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "initial", ChunkData{
+		Sessions: []store.Session{{
+			ID:        sessionID,
+			Project:   "proj-a",
+			Directory: "/tmp/proj-a",
+			StartedAt: createdAt,
+		}},
+		Observations: []store.Observation{{
+			SyncID:    obsSyncID,
+			SessionID: sessionID,
+			Type:      "bugfix",
+			Title:     "Historical tombstone",
+			Content:   "Previously exported observation",
+			Scope:     "project",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+		}},
+	})
+	writeLocalChunkFile(t, syncDir, "tombstone", ChunkData{
+		Observations: []store.Observation{{
+			SyncID:    obsSyncID,
+			SessionID: sessionID,
+			Type:      "bugfix",
+			Title:     "Historical tombstone",
+			Content:   "Previously exported observation",
+			Scope:     "project",
+			CreatedAt: createdAt,
+			UpdatedAt: deletedAt,
+			DeletedAt: &tombstoneDeletedAt,
+		}},
+	})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{
+		{ID: "initial", CreatedAt: "2025-01-01T00:00:00Z"},
+		{ID: "tombstone", CreatedAt: "2025-02-01T00:00:00Z"},
+	}})
+
+	s := newTestStore(t)
+	if _, err := New(s, syncDir).Import(); err != nil {
+		t.Fatalf("import tombstone: %v", err)
+	}
+
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("repeat export after tombstone import: %v", err)
+	}
+	if !result.IsEmpty {
+		t.Fatalf("repeat export = %+v, want empty", result)
+	}
+}
+
+func TestExportedChunkKeysObservationMutationIdentity(t *testing.T) {
+	validPayload := `{"sync_id":" obs-mutation-only ","session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`
+	quotedPayload, err := json.Marshal(validPayload)
+	if err != nil {
+		t.Fatalf("marshal quoted payload: %v", err)
+	}
+	tests := []struct {
+		name           string
+		mutation       store.SyncMutation
+		wantHistorical bool
+		wantAvailable  bool
+		wantKey        string
+	}{
+		{
+			name:           "valid mutation-only upsert preserves its endpoint identity",
+			mutation:       store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: " obs-mutation-only ", Op: store.SyncOpUpsert, Payload: validPayload},
+			wantHistorical: true,
+			wantAvailable:  true,
+			wantKey:        " obs-mutation-only ",
+		},
+		{
+			name:           "JSON-string payload preserves its endpoint identity",
+			mutation:       store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: " obs-mutation-only ", Op: store.SyncOpUpsert, Payload: string(quotedPayload)},
+			wantHistorical: true,
+			wantAvailable:  true,
+			wantKey:        " obs-mutation-only ",
+		},
+		{
+			name:     "empty payload identity is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "obs-empty", Op: store.SyncOpUpsert, Payload: `{"sync_id":"","session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`},
+		},
+		{
+			name:     "whitespace payload identity is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: " \t", Op: store.SyncOpUpsert, Payload: `{"sync_id":" \t","session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`},
+		},
+		{
+			name:     "malformed payload identity is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "1", Op: store.SyncOpUpsert, Payload: `{"sync_id":1,"session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`},
+		},
+		{
+			name:     "malformed payload is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "obs-malformed", Op: store.SyncOpUpsert, Payload: `{"sync_id"`},
+		},
+		{
+			name:     "missing payload identity is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "obs-missing", Op: store.SyncOpUpsert, Payload: `{"session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`},
+		},
+		{
+			name:     "mismatched identity is rejected",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "obs-entity-key", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-payload","session_id":"session","type":"decision","title":"title","content":"content","scope":"project"}`},
+		},
+		{
+			name:           "tombstone preserves history but not endpoint availability",
+			mutation:       store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "obs-tombstone", Op: store.SyncOpDelete},
+			wantHistorical: true,
+			wantKey:        "obs-tombstone",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(ChunkData{Mutations: []store.SyncMutation{tc.mutation}})
+			if err != nil {
+				t.Fatalf("marshal chunk: %v", err)
+			}
+			transport := newFakeCloudTransport()
+			transport.chunks["history"] = raw
+			sy := NewWithTransport(nil, transport)
+			_, available, historical, err := sy.exportedChunkKeys(&Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "history"}}})
+			if err != nil {
+				t.Fatalf("exportedChunkKeys: %v", err)
+			}
+			if got := len(historical); got != boolToInt(tc.wantHistorical) {
+				t.Fatalf("historical keys = %v, want historical=%t", historical, tc.wantHistorical)
+			}
+			if got := len(available); got != boolToInt(tc.wantAvailable) {
+				t.Fatalf("available keys = %v, want available=%t", available, tc.wantAvailable)
+			}
+			if tc.wantKey == "" {
+				return
+			}
+			if _, ok := historical[tc.wantKey]; ok != tc.wantHistorical {
+				t.Fatalf("historical key %q present=%t, want %t", tc.wantKey, ok, tc.wantHistorical)
+			}
+			if _, ok := available[tc.wantKey]; ok != tc.wantAvailable {
+				t.Fatalf("available key %q present=%t, want %t", tc.wantKey, ok, tc.wantAvailable)
+			}
+		})
+	}
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+// TestLocalChunkExportReexportsRelationUpdatedAfterLastChunk covers the second
+// branch of the export filter: a relation already present in a prior chunk but
+// re-judged after the latest chunk must be exported again so the update
+// propagates. A regression to pure presence-based filtering would silently drop
+// this update while every other relation test still passes.
+func TestLocalChunkExportReexportsRelationUpdatedAfterLastChunk(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+
+	// rel-updated already lives in a prior chunk (already exported)...
+	seedRelationForProject(t, s, "proj-a", "sess-updated", "rel-updated")
+	// ...but it was re-judged AFTER that chunk's CreatedAt (2025-06-01).
+	if _, err := s.DB().Exec(
+		`UPDATE memory_relations SET updated_at='2025-07-01 00:00:00' WHERE sync_id='rel-updated'`,
+	); err != nil {
+		t.Fatalf("bump rel-updated: %v", err)
+	}
+
+	chunksDir := filepath.Join(syncDir, "chunks")
+	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+		t.Fatalf("mkdir chunks: %v", err)
+	}
+	writeLocalChunkFile(t, syncDir, "pastchunk00", ChunkData{
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-updated",
+			Op:        store.SyncOpUpsert,
+		}},
+	})
+	writeManifestFile(t, syncDir, &Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: "pastchunk00", CreatedBy: "alice", CreatedAt: "2025-06-01T00:00:00Z"}},
+	})
+
+	result, err := New(s, syncDir).Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected export to re-export the updated relation, got empty result")
+	}
+
+	chunkJSON, err := readGzip(filepath.Join(syncDir, "chunks", result.ChunkID+".jsonl.gz"))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(chunkJSON, &chunk); err != nil {
+		t.Fatalf("unmarshal chunk: %v", err)
+	}
+
+	found := false
+	for _, m := range chunk.Mutations {
+		if m.EntityKey == "rel-updated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("relation updated after the last chunk must be re-exported, got mutations %+v", chunk.Mutations)
+	}
+}
+
+func TestUpgradeDeterministicReasonCodes(t *testing.T) {
+	tests := []struct {
+		name            string
+		project         string
+		cloudConfigured bool
+		enrolled        bool
+		policyDenied    bool
+		wantClass       string
+		wantCode        string
+		wantStatus      string
+		wantErrContains string
+	}{
+		{
+			name:            "ready when configured and enrolled",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        true,
+			wantClass:       UpgradeReasonClassReady,
+			wantCode:        UpgradeReasonReady,
+			wantStatus:      UpgradeStatusReady,
+		},
+		{
+			name:            "repairable when unenrolled",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        false,
+			wantClass:       UpgradeReasonClassRepairable,
+			wantCode:        UpgradeReasonRepairableUnenrolled,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "policy when cloud config missing",
+			project:         "proj-a",
+			cloudConfigured: false,
+			enrolled:        false,
+			wantClass:       UpgradeReasonClassPolicy,
+			wantCode:        UpgradeReasonPolicyConfig,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "policy forbidden explicit",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        false,
+			policyDenied:    true,
+			wantClass:       UpgradeReasonClassPolicy,
+			wantCode:        UpgradeReasonPolicyForbidden,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "blocked project required fails loudly",
+			project:         "   ",
+			cloudConfigured: true,
+			wantErrContains: "project is required",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report, err := DiagnoseCloudUpgrade(UpgradeDiagnosisInput{
+				Project:         tc.project,
+				CloudConfigured: tc.cloudConfigured,
+				ProjectEnrolled: tc.enrolled,
+				PolicyDenied:    tc.policyDenied,
+			})
+			if tc.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrContains, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected diagnosis error: %v", err)
+			}
+			if report.Class != tc.wantClass || report.Code != tc.wantCode || report.Status != tc.wantStatus {
+				t.Fatalf("unexpected report: %+v", report)
+			}
+
+			report2, err := DiagnoseCloudUpgrade(UpgradeDiagnosisInput{
+				Project:         tc.project,
+				CloudConfigured: tc.cloudConfigured,
+				ProjectEnrolled: tc.enrolled,
+				PolicyDenied:    tc.policyDenied,
+			})
+			if err != nil {
+				t.Fatalf("second diagnosis error: %v", err)
+			}
+			if report != report2 {
+				t.Fatalf("expected deterministic reports, got %+v and %+v", report, report2)
+			}
+		})
+	}
+}
+
+func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("bootstrap-s1", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: "bootstrap-s1", Type: "decision", Title: "seed", Content: "seed", Project: "proj-a", Scope: "project"}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:     "proj-a",
+		Stage:       store.UpgradeStageBootstrapEnrolled,
+		RepairClass: store.UpgradeRepairClassRepairable,
+		Snapshot: store.CloudUpgradeSnapshot{
+			Captured:        true,
+			ProjectEnrolled: false,
+		},
+	}); err != nil {
+		t.Fatalf("seed checkpoint stage: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	result, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "upgrade-test"})
+	if err != nil {
+		t.Fatalf("bootstrap from checkpoint: %v", err)
+	}
+	if !result.Resumed || result.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected resumed verified bootstrap, got %+v", result)
+	}
+	if transport.writeChunkCalls == 0 {
+		t.Fatal("expected first push to write at least one chunk")
+	}
+
+	writeCallsBefore := transport.writeChunkCalls
+	result2, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "upgrade-test"})
+	if err != nil {
+		t.Fatalf("second bootstrap resume: %v", err)
+	}
+	if !result2.NoOp || result2.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected no-op verified bootstrap rerun, got %+v", result2)
+	}
+	if transport.writeChunkCalls != writeCallsBefore {
+		t.Fatalf("expected no additional push writes on rerun, before=%d after=%d", writeCallsBefore, transport.writeChunkCalls)
+	}
+
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load checkpoint state: %v", err)
+	}
+	if state == nil || !state.Snapshot.Captured || state.Snapshot.ProjectEnrolled {
+		t.Fatalf("expected checkpoints to preserve the pre-bootstrap snapshot, got %+v", state)
+	}
+	var snapshotJSON string
+	if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+		t.Fatalf("read persisted checkpoint snapshot: %v", err)
+	}
+	if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+		t.Fatalf("checkpoint persisted credential material: %s", snapshotJSON)
+	}
+}
+
+func TestBootstrapAndRollbackAcceptMigratedLegacyCheckpoints(t *testing.T) {
+	cfg, err := store.DefaultConfig()
+	if err != nil {
+		t.Fatalf("default store config: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store before legacy seed: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", filepath.Join(cfg.DataDir, "engram.db"))
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	for _, project := range []string{"legacy-resume", "legacy-rollback"} {
+		if _, err := raw.Exec(`INSERT INTO cloud_upgrade_state (project, stage, snapshot_json) VALUES (?, ?, ?)`, project, store.UpgradeStageBootstrapPushed, `{"cloud_config_present":true,"project_enrolled":false}`); err != nil {
+			_ = raw.Close()
+			t.Fatalf("seed legacy checkpoint for %s: %v", project, err)
+		}
+	}
+	if _, err := raw.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES ('legacy-rollback')`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("seed interrupted enrollment: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	resumed, err := BootstrapProject(s, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "legacy-resume"})
+	if err != nil {
+		t.Fatalf("resume migrated checkpoint: %v", err)
+	}
+	if !resumed.Resumed || resumed.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected migrated checkpoint to resume, got %+v", resumed)
+	}
+
+	rolledBack, err := RollbackProject(s, UpgradeRollbackOptions{Project: "legacy-rollback"})
+	if err != nil {
+		t.Fatalf("rollback migrated checkpoint: %v", err)
+	}
+	if rolledBack.Stage != store.UpgradeStageRolledBack {
+		t.Fatalf("expected migrated checkpoint to roll back, got %+v", rolledBack)
+	}
+	enrolled, err := s.IsProjectEnrolled("legacy-rollback")
+	if err != nil || enrolled {
+		t.Fatalf("rollback must restore legacy enrollment snapshot: enrolled=%t err=%v", enrolled, err)
+	}
+}
+
+func TestBootstrapProjectRejectsUncapturedPostSideEffectCheckpoints(t *testing.T) {
+	for _, stage := range []string{
+		store.UpgradeStageBootstrapEnrolled,
+		store.UpgradeStageBootstrapPushed,
+		store.UpgradeStageBootstrapVerified,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+				Project:     "proj-a",
+				Stage:       stage,
+				RepairClass: store.UpgradeRepairClassRepairable,
+			}); err != nil {
+				t.Fatalf("seed uncaptured checkpoint: %v", err)
+			}
+
+			transport := newFakeCloudTransport()
+			_, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a"})
+			if err == nil || !strings.Contains(err.Error(), "requires a captured pre-bootstrap snapshot") {
+				t.Fatalf("expected uncaptured checkpoint failure, got %v", err)
+			}
+			if transport.writeChunkCalls != 0 {
+				t.Fatalf("uncaptured checkpoint must not push, writes=%d", transport.writeChunkCalls)
+			}
+			enrolled, err := s.IsProjectEnrolled("proj-a")
+			if err != nil || enrolled {
+				t.Fatalf("uncaptured checkpoint must not change enrollment: enrolled=%t err=%v", enrolled, err)
+			}
+		})
+	}
+}
+
+func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:     "proj-a",
+		Stage:       store.UpgradeStageBootstrapPushed,
+		RepairClass: store.UpgradeRepairClassRepairable,
+		Snapshot: store.CloudUpgradeSnapshot{
+			Captured:        true,
+			ProjectEnrolled: false,
+		},
+	}); err != nil {
+		t.Fatalf("seed rollback state: %v", err)
+	}
+
+	hooks := &fakeUpgradeHooks{}
+	result, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+	if err != nil {
+		t.Fatalf("rollback project: %v", err)
+	}
+	if result.Stage != store.UpgradeStageRolledBack {
+		t.Fatalf("expected rolled_back stage, got %q", result.Stage)
+	}
+	if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+		t.Fatalf("expected one stop/resume call, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+	}
+
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageBootstrapVerified, RepairClass: store.UpgradeRepairClassReady}); err != nil {
+		t.Fatalf("seed verified boundary: %v", err)
+	}
+	hooks = &fakeUpgradeHooks{}
+	_, err = RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+	if err == nil || !strings.Contains(err.Error(), "rollback is unavailable post-bootstrap") {
+		t.Fatalf("expected post-bootstrap rollback failure, got %v", err)
+	}
+	if hooks.stopCalls != 0 || hooks.resumeCalls != 0 {
+		t.Fatalf("hooks must not run after rollback boundary, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+	}
+}
+
+func TestBootstrapProjectValidationAndCreatedByDefault(t *testing.T) {
+	t.Run("store is required", func(t *testing.T) {
+		_, err := BootstrapProject(nil, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "proj-a"})
+		if err == nil || !strings.Contains(err.Error(), "requires store") {
+			t.Fatalf("expected requires store error, got %v", err)
+		}
+	})
+
+	t.Run("project is required", func(t *testing.T) {
+		s := newTestStore(t)
+		_, err := BootstrapProject(s, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "   "})
+		if err == nil || !strings.Contains(err.Error(), "requires project") {
+			t.Fatalf("expected requires project error, got %v", err)
+		}
+	})
+
+	t.Run("blank createdBy defaults to upgrade-bootstrap", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("bootstrap-default-createdby", "proj-a", "/tmp/proj-a"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if _, err := s.AddObservation(store.AddObservationParams{SessionID: "bootstrap-default-createdby", Type: "decision", Title: "seed", Content: "seed", Project: "proj-a", Scope: "project"}); err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+
+		transport := newFakeCloudTransport()
+		result, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "   "})
+		if err != nil {
+			t.Fatalf("bootstrap project: %v", err)
+		}
+		if result.Project != "proj-a" || result.Stage != store.UpgradeStageBootstrapVerified || result.Resumed {
+			t.Fatalf("unexpected bootstrap result: %+v", result)
+		}
+		if transport.writeChunkCalls == 0 {
+			t.Fatal("expected first bootstrap push to write at least one chunk")
+		}
+		if transport.lastCreatedBy != "upgrade-bootstrap" {
+			t.Fatalf("expected default createdBy upgrade-bootstrap, got %q", transport.lastCreatedBy)
+		}
+		state, err := s.GetCloudUpgradeState("proj-a")
+		if err != nil {
+			t.Fatalf("load direct bootstrap state: %v", err)
+		}
+		if state == nil || !state.Snapshot.Captured || state.Snapshot.ProjectEnrolled {
+			t.Fatalf("expected direct bootstrap to preserve the pre-enrollment snapshot, got %+v", state)
+		}
+		var snapshotJSON string
+		if err := s.DB().QueryRow(`SELECT snapshot_json FROM cloud_upgrade_state WHERE project = ?`, "proj-a").Scan(&snapshotJSON); err != nil {
+			t.Fatalf("read persisted direct bootstrap snapshot: %v", err)
+		}
+		if strings.Contains(snapshotJSON, `"token"`) || strings.Contains(snapshotJSON, "cloud_config") {
+			t.Fatalf("direct bootstrap persisted credential material: %s", snapshotJSON)
+		}
+	})
+}
+
+func TestRollbackProjectHandlesHookFailures(t *testing.T) {
+	t.Run("stop hook failure blocks rollback", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{stopErr: errors.New("stop failed")}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "stop autosync") {
+			t.Fatalf("expected stop autosync error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 0 {
+			t.Fatalf("unexpected hook call counts: stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+
+	t.Run("rollback failure attempts resume hook", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{
+			onStop: func() {
+				_ = s.ClearCloudUpgradeState("proj-a")
+			},
+		}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "rollback requires existing upgrade checkpoint state") {
+			t.Fatalf("expected rollback state missing error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+			t.Fatalf("expected rollback failure to invoke resume once, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+
+	t.Run("resume hook failure is surfaced", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				Captured:        true,
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{resumeErr: errors.New("resume failed")}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "resume autosync") {
+			t.Fatalf("expected resume autosync error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+			t.Fatalf("expected stop/resume once, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+}
+
+func TestCloudSyncExportBehaviorUnchangedWhenUpgradeStateExists(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("sync-regression", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: "sync-regression", Type: "decision", Title: "regression", Content: "keep legacy behavior", Project: "proj-a", Scope: "project"}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageDoctorBlocked, RepairClass: store.UpgradeRepairClassRepairable, LastErrorCode: "upgrade_repairable_unenrolled", LastErrorMessage: "legacy drift"}); err != nil {
+		t.Fatalf("seed upgrade state: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	cloudSyncer := NewCloudWithTransport(s, transport, "proj-a")
+	result, err := cloudSyncer.Export("regression", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatalf("expected non-empty export to preserve legacy sync path, got %+v", result)
+	}
+	if transport.writeChunkCalls == 0 {
+		t.Fatalf("expected cloud export to push at least one chunk")
+	}
+
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load upgrade state: %v", err)
+	}
+	if state == nil || state.Stage != store.UpgradeStageDoctorBlocked {
+		t.Fatalf("legacy cloud export must not mutate upgrade stage, got %+v", state)
+	}
+}
+
+func TestExportErrors(t *testing.T) {
+	t.Run("create chunks dir", func(t *testing.T) {
+		s := newTestStore(t)
+		badPath := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(badPath, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+
+		sy := New(s, badPath)
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "create chunks dir") {
+			t.Fatalf("expected create chunks dir error, got %v", err)
+		}
+	})
+
+	t.Run("invalid manifest", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(syncDir, "manifest.json"), []byte("not-json"), 0o644); err != nil {
+			t.Fatalf("write invalid manifest: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "parse manifest") {
+			t.Fatalf("expected parse manifest error, got %v", err)
+		}
+	})
+
+	t.Run("get synced chunks", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		if err := s.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "get synced chunks") {
+			t.Fatalf("expected get synced chunks error, got %v", err)
+		}
+	})
+
+	t.Run("already known chunk id", func(t *testing.T) {
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		sy := New(s, t.TempDir())
+
+		data, err := s.Export()
+		if err != nil {
+			t.Fatalf("store export: %v", err)
+		}
+		chunk := sy.filterNewData(data, "")
+		chunkJSON, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("marshal chunk: %v", err)
+		}
+		hash := sha256.Sum256(chunkJSON)
+		chunkID := hex.EncodeToString(hash[:])[:8]
+
+		writeManifestFile(t, sy.syncDir, &Manifest{
+			Version: 1,
+			Chunks: []ChunkEntry{{
+				ID:        chunkID,
+				CreatedBy: "alice",
+				CreatedAt: "2000-01-01T00:00:00Z",
+			}},
+		})
+
+		res, err := sy.Export("alice", "")
+		if err != nil {
+			t.Fatalf("export: %v", err)
+		}
+		if !res.IsEmpty {
+			t.Fatalf("expected empty export for known chunk hash, got %+v", res)
+		}
+	})
+
+	t.Run("store export error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		sy := New(s, t.TempDir())
+
+		storeExportData = func(_ *store.Store) (*store.ExportData, error) {
+			return nil, errors.New("boom export")
+		}
+
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "export data") {
+			t.Fatalf("expected export data error, got %v", err)
+		}
+	})
+
+	t.Run("marshal chunk error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		sy := New(s, t.TempDir())
+
+		jsonMarshalChunk = func(v any) ([]byte, error) {
+			return nil, fmt.Errorf("forced marshal error: %T", v)
+		}
+
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "marshal chunk") {
+			t.Fatalf("expected marshal chunk error, got %v", err)
+		}
+	})
+
+	t.Run("write chunk error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		sy := New(s, t.TempDir())
+
+		gzipWriterFactory = func(_ *os.File) gzipWriter {
+			return &fakeGzipWriter{writeErr: errors.New("forced gzip write")}
+		}
+
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "write chunk") {
+			t.Fatalf("expected write chunk error, got %v", err)
+		}
+	})
+
+	t.Run("write manifest error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		syncDir := t.TempDir()
+		jsonMarshalManifest = func(v any, prefix, indent string) ([]byte, error) {
+			_ = v
+			_ = prefix
+			_ = indent
+			return nil, errors.New("forced manifest marshal failure")
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "write manifest") {
+			t.Fatalf("expected write manifest error, got %v", err)
+		}
+	})
+
+	t.Run("record synced chunk error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		sy := New(s, t.TempDir())
+
+		storeRecordSynced = func(_ *store.Store, _, _ string) error {
+			return errors.New("forced record failure")
+		}
+
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "record synced chunk") {
+			t.Fatalf("expected record synced chunk error, got %v", err)
+		}
+	})
+
+	t.Run("store export relations error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		seedStoreForSync(t, s)
+		sy := New(s, t.TempDir())
+
+		storeExportRelations = func(_ *store.Store, _ string) ([]store.SyncMutation, error) {
+			return nil, errors.New("boom relations")
+		}
+
+		if _, err := sy.Export("alice", ""); err == nil || !strings.Contains(err.Error(), "export relations") {
+			t.Fatalf("expected export relations error, got %v", err)
+		}
+	})
+}
+
+func TestExportUsesProjectScopedStoreExportWhenProjectProvided(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	sy := New(s, t.TempDir())
+
+	projectExportCalled := 0
+	storeExportData = func(_ *store.Store) (*store.ExportData, error) {
+		return nil, errors.New("global export should not be called for project-scoped sync")
+	}
+	storeExportDataForProject = func(_ *store.Store, project string) (*store.ExportData, error) {
+		projectExportCalled++
+		if project != "proj-a" {
+			t.Fatalf("expected project proj-a, got %q", project)
+		}
+		return &store.ExportData{Version: "0.1.0", ExportedAt: time.Now().UTC().Format(time.RFC3339)}, nil
+	}
+
+	res, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !res.IsEmpty {
+		t.Fatalf("expected empty export result for empty project dataset, got %+v", res)
+	}
+	if projectExportCalled != 1 {
+		t.Fatalf("expected project-scoped export hook to be called once, got %d", projectExportCalled)
+	}
+}
+
+func TestExportDoesNotReconcileLocallyMissingChunkByOwnershipHeuristic(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	transport := newFakeCloudTransport()
+	sy := NewWithTransport(s, transport)
+
+	var recordCalls int
+	storeRecordSynced = func(_ *store.Store, _, _ string) error {
+		recordCalls++
+		if recordCalls == 1 {
+			return errors.New("forced record failure")
+		}
+		return nil
+	}
+
+	first, err := sy.Export("alice", "")
+	if err == nil || !strings.Contains(err.Error(), "record synced chunk") {
+		t.Fatalf("expected record synced chunk error, got result=%+v err=%v", first, err)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("expected first export to write one chunk, got %d", transport.writeChunkCalls)
+	}
+
+	second, err := sy.Export("alice", "")
+	if err != nil {
+		t.Fatalf("second export should reconcile local sync tracking: %v", err)
+	}
+	if second == nil || !second.IsEmpty {
+		t.Fatalf("expected second export to be empty after reconciliation, got %+v", second)
+	}
+	if recordCalls != 1 {
+		t.Fatalf("expected no ownership-based reconciliation retries, got %d calls", recordCalls)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("expected no duplicate remote chunk writes, got %d", transport.writeChunkCalls)
+	}
+}
+
+func TestOwnershipManifestCompatibilityIsScopedToSynchronizedSessions(t *testing.T) {
+	t.Run("shared project is compatible despite unrelated owned session", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("shared-project-a", "project-a", "/tmp/a"); err != nil {
+			t.Fatalf("create shared session: %v", err)
+		}
+		if err := s.CreateSessionWithOwnershipMode("manual-save-project-b", "project-b", "/tmp/b", store.SessionOwnershipProjectOwned); err != nil {
+			t.Fatalf("create unrelated project-owned session: %v", err)
+		}
+		syncDir := filepath.Join(t.TempDir(), ".engram")
+		writeLocalChunkFile(t, syncDir, "legacy", ChunkData{})
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "legacy", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+		if _, err := New(s, syncDir).Export("alice", "project-a"); err != nil {
+			t.Fatalf("export shared project against legacy manifest: %v", err)
+		}
+	})
+
+	t.Run("legacy delete cannot remove or downgrade project owned session", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/original", store.SessionOwnershipProjectOwned); err != nil {
+			t.Fatalf("create project-owned session: %v", err)
+		}
+		syncDir := filepath.Join(t.TempDir(), ".engram")
+		writeLocalChunkFile(t, syncDir, "delete", ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntitySession, EntityKey: "manual-save-project-a", Op: store.SyncOpDelete, Payload: `{"id":"manual-save-project-a","deleted":true}`}}})
+		writeLocalChunkFile(t, syncDir, "recreate", ChunkData{Sessions: []store.Session{{ID: "manual-save-project-a", Project: "project-a", OwnershipMode: store.SessionOwnershipShared, Directory: "/recreated"}}})
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "delete", CreatedAt: "2020-01-01T00:00:00Z"}, {ID: "recreate", CreatedAt: "2020-01-01T00:00:01Z"}}})
+
+		if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), "legacy delete targets project-owned session") {
+			t.Fatalf("legacy delete import error = %v", err)
+		}
+		session, err := s.GetSession("manual-save-project-a")
+		if err != nil || session.Project != "project-a" || session.OwnershipMode != store.SessionOwnershipProjectOwned || session.Directory != "/original" {
+			t.Fatalf("session after rejected legacy sequence = %#v, %v", session, err)
+		}
+	})
+
+	t.Run("preflight rejects later incompatible chunk before mutation", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := filepath.Join(t.TempDir(), ".engram")
+		writeLocalChunkFile(t, syncDir, "shared", ChunkData{Sessions: []store.Session{{ID: "shared-session", Project: "project-a", OwnershipMode: store.SessionOwnershipShared}}})
+		writeLocalChunkFile(t, syncDir, "owned", ChunkData{Sessions: []store.Session{{ID: "manual-save-project-b", Project: "project-b", OwnershipMode: store.SessionOwnershipProjectOwned}}})
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "shared", CreatedAt: "2020-01-01T00:00:00Z"}, {ID: "owned", CreatedAt: "2020-01-01T00:00:01Z"}}})
+
+		if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), "incoming project-owned sessions") {
+			t.Fatalf("legacy preflight import error = %v", err)
+		}
+		if _, err := s.GetSession("shared-session"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("shared session after rejected preflight error = %v, want missing", err)
+		}
+	})
+
+	t.Run("preflight rejects JSON-string project-owned payload", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := filepath.Join(t.TempDir(), ".engram")
+		writeLocalChunkFile(t, syncDir, "shared", ChunkData{Sessions: []store.Session{{ID: "shared-session", Project: "project-a", OwnershipMode: store.SessionOwnershipShared}}})
+		encoded, err := json.Marshal(`{"id":"manual-save-project-b","project":"project-b","ownership_mode":"project_owned"}`)
+		if err != nil {
+			t.Fatalf("encode session payload: %v", err)
+		}
+		writeLocalChunkFile(t, syncDir, "owned", ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntitySession, EntityKey: "manual-save-project-b", Op: store.SyncOpUpsert, Payload: string(encoded)}}})
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "shared", CreatedAt: "2020-01-01T00:00:00Z"}, {ID: "owned", CreatedAt: "2020-01-01T00:00:01Z"}}})
+
+		if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), "incoming project-owned sessions") {
+			t.Fatalf("JSON-string legacy preflight import error = %v", err)
+		}
+		if _, err := s.GetSession("shared-session"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("shared session after JSON-string preflight error = %v, want missing", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		mutation store.SyncMutation
+	}{
+		{
+			name: "observation project from mutation",
+			mutation: store.SyncMutation{
+				Entity:    store.SyncEntityObservation,
+				EntityKey: "blocked-observation",
+				Op:        store.SyncOpUpsert,
+				Project:   "project-a",
+				Payload:   `{"sync_id":"blocked-observation","session_id":"manual-save-project-a","type":"manual","title":"blocked","content":"blocked","scope":"project"}`,
+			},
+		},
+		{
+			name: "prompt project from payload",
+			mutation: store.SyncMutation{
+				Entity:    store.SyncEntityPrompt,
+				EntityKey: "blocked-prompt",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{"sync_id":"blocked-prompt","session_id":"manual-save-project-a","content":"blocked","project":"project-a"}`,
+			},
+		},
+	} {
+		t.Run("preflight rejects "+tc.name+" before applying any chunk", func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+				t.Fatalf("create project-owned session: %v", err)
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "safe", ChunkData{Sessions: []store.Session{{ID: "would-import", Project: "project-b", OwnershipMode: store.SessionOwnershipShared, Directory: "/tmp/b"}}})
+			writeLocalChunkFile(t, syncDir, "blocked", ChunkData{Mutations: []store.SyncMutation{tc.mutation}})
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "safe", CreatedAt: "2020-01-01T00:00:00Z"}, {ID: "blocked", CreatedAt: "2020-01-01T00:00:01Z"}}})
+
+			if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), `project "project-a"`) {
+				t.Fatalf("legacy %s preflight import error = %v, want project rejection", tc.name, err)
+			}
+			if _, err := s.GetSession("would-import"); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("safe chunk session after rejected preflight error = %v, want missing", err)
+			}
+			var localCursorCount int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM sync_state WHERE target_key = ?`, store.LocalChunkTargetKey).Scan(&localCursorCount); err != nil {
+				t.Fatalf("count local cursor rows: %v", err)
+			}
+			if localCursorCount != 0 {
+				t.Fatalf("rejected preflight created %d local cursor rows, want 0", localCursorCount)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name, entity, key, payload string
+	}{
+		{"observation delete", store.SyncEntityObservation, "deleted-observation", `{"sync_id":"deleted-observation","session_id":"manual-save-project-a","project":"project-a","deleted":true}`},
+		{"prompt delete", store.SyncEntityPrompt, "deleted-prompt", `{"sync_id":"deleted-prompt","session_id":"manual-save-project-a","project":"project-a","deleted":true}`},
+	} {
+		t.Run("preflight rejects "+tc.name+" for project-owned session", func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+				t.Fatalf("create project-owned session: %v", err)
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "delete", ChunkData{Mutations: []store.SyncMutation{{Entity: tc.entity, EntityKey: tc.key, Op: store.SyncOpDelete, Payload: tc.payload}}})
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "delete", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+			if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), `project "project-a"`) {
+				t.Fatalf("legacy %s preflight import error = %v, want project rejection", tc.name, err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name, table string
+		mutation    store.SyncMutation
+	}{
+		{
+			name:  "observation for unrelated shared project",
+			table: "observations",
+			mutation: store.SyncMutation{Entity: store.SyncEntityObservation, EntityKey: "accepted-observation", Op: store.SyncOpUpsert, Project: "project-b",
+				Payload: `{"sync_id":"accepted-observation","session_id":"shared-project-b","type":"manual","title":"accepted","content":"accepted","scope":"project"}`},
+		},
+		{
+			name:  "prompt for unrelated shared project",
+			table: "user_prompts",
+			mutation: store.SyncMutation{Entity: store.SyncEntityPrompt, EntityKey: "accepted-prompt", Op: store.SyncOpUpsert,
+				Payload: `{"sync_id":"accepted-prompt","session_id":"shared-project-b","content":"accepted","project":"project-b"}`},
+		},
+	} {
+		t.Run("preflight accepts "+tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+				t.Fatalf("create unrelated project-owned session: %v", err)
+			}
+			if err := s.CreateSession("shared-project-b", "project-b", "/tmp/b"); err != nil {
+				t.Fatalf("create shared session: %v", err)
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "accepted", ChunkData{Mutations: []store.SyncMutation{tc.mutation}})
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "accepted", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+			if _, err := New(s, syncDir).Import(); err != nil {
+				t.Fatalf("import legacy %s: %v", tc.name, err)
+			}
+			var count int
+			if err := s.DB().QueryRow(`SELECT count(*) FROM `+tc.table+` WHERE sync_id = ?`, tc.mutation.EntityKey).Scan(&count); err != nil {
+				t.Fatalf("count imported %s: %v", tc.name, err)
+			}
+			if count != 1 {
+				t.Fatalf("imported %s count = %d, want 1", tc.name, count)
+			}
+		})
+	}
+
+	for _, tc := range []struct{ name, id string }{{"shared", "shared-session"}, {"absent", "absent-session"}} {
+		t.Run("legacy delete remains compatible for "+tc.name+" session", func(t *testing.T) {
+			s := newTestStore(t)
+			if tc.name == "shared" {
+				if err := s.CreateSession(tc.id, "project-a", "/tmp/a"); err != nil {
+					t.Fatalf("create shared session: %v", err)
+				}
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "delete", ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntitySession, EntityKey: tc.id, Op: store.SyncOpDelete, Payload: `{"id":"` + tc.id + `","deleted":true}`}}})
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "delete", CreatedAt: "2020-01-01T00:00:00Z"}}})
+			if _, err := New(s, syncDir).Import(); err != nil {
+				t.Fatalf("legacy delete import: %v", err)
+			}
+			if _, err := s.GetSession(tc.id); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("session after legacy delete error = %v, want missing", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name      string
+		setup     func(t *testing.T, s *store.Store)
+		incoming  store.Session
+		wantError string
+	}{
+		{
+			name: "existing project owned session matches incoming project",
+			setup: func(t *testing.T, s *store.Store) {
+				t.Helper()
+				if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+					t.Fatalf("create project-owned session: %v", err)
+				}
+			},
+			incoming:  store.Session{ID: "incoming-shared-a", Project: "project-a", OwnershipMode: store.SessionOwnershipShared, Directory: "/tmp/a"},
+			wantError: "project \"project-a\"",
+		},
+		{
+			name:      "incoming project owned session",
+			setup:     func(*testing.T, *store.Store) {},
+			incoming:  store.Session{ID: "manual-save-project-c", Project: "project-c", OwnershipMode: store.SessionOwnershipProjectOwned, Directory: "/tmp/c"},
+			wantError: "incoming project-owned sessions",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			tc.setup(t, s)
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			writeLocalChunkFile(t, syncDir, "legacy", ChunkData{Sessions: []store.Session{tc.incoming}})
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "legacy", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+			if _, err := New(s, syncDir).Import(); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("import legacy manifest error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestCloudImportAcceptsPendingProjectOwnedChunkFromV2Manifest(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSessionWithOwnershipMode("local-project-owned", "project-a", "/tmp/local", store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatalf("create project-owned session: %v", err)
+	}
+	if err := s.EnrollProject("project-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: ownershipModeManifestVersion, Chunks: []ChunkEntry{{ID: "pending", CreatedAt: "2026-01-01T00:00:00Z"}}}
+	transport.chunks["pending"] = []byte(`{"sessions":[{"id":"shared-session","project":"project-a","directory":"/tmp/shared"}]}`)
+
+	result, err := NewCloudWithTransport(s, transport, "project-a").Import()
+	if err != nil {
+		t.Fatalf("import pending v2 cloud chunk: %v", err)
+	}
+	if result.ChunksImported != 1 || result.SessionsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if _, err := s.GetSession("shared-session"); err != nil {
+		t.Fatalf("expected pending cloud session to import: %v", err)
+	}
+}
+
+func TestOwnershipManifestVersionDoesNotDowngradeFutureManifest(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatalf("create project-owned session: %v", err)
+	}
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "existing", ChunkData{})
+	writeManifestFile(t, syncDir, &Manifest{Version: 3, Chunks: []ChunkEntry{{ID: "existing", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+	if _, err := New(s, syncDir).Export("alice", "project-a"); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	manifest, err := NewFileTransport(syncDir).ReadManifest()
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if manifest.Version != 3 {
+		t.Fatalf("manifest version = %d, want 3", manifest.Version)
+	}
+}
+
+func TestOwnershipManifestVersionUpgradesNonEmptyLegacyManifest(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatalf("create project-owned session: %v", err)
+	}
+	syncDir := filepath.Join(t.TempDir(), ".engram")
+	writeLocalChunkFile(t, syncDir, "existing", ChunkData{})
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "existing", CreatedAt: "2020-01-01T00:00:00Z"}}})
+
+	if _, err := New(s, syncDir).Export("alice", "project-a"); err != nil {
+		t.Fatalf("export project-owned data through legacy manifest: %v", err)
+	}
+	manifest, err := NewFileTransport(syncDir).ReadManifest()
+	if err != nil {
+		t.Fatalf("read upgraded manifest: %v", err)
+	}
+	if manifest.Version != ownershipModeManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", manifest.Version, ownershipModeManifestVersion)
+	}
+}
+
+func TestOwnershipManifestVersionUpgradesLegacyManifestOnEmptyExports(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		keepOldChunks bool
+	}{
+		{name: "genuinely empty export", keepOldChunks: true},
+		{name: "deduplicated export"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+				t.Fatalf("create project-owned session: %v", err)
+			}
+			syncDir := filepath.Join(t.TempDir(), ".engram")
+			sy := New(s, syncDir)
+			if _, err := sy.Export("alice", "project-a"); err != nil {
+				t.Fatalf("seed export: %v", err)
+			}
+			manifest, err := NewFileTransport(syncDir).ReadManifest()
+			if err != nil {
+				t.Fatalf("read seeded manifest: %v", err)
+			}
+			expectedChunks := append([]ChunkEntry(nil), manifest.Chunks...)
+			legacyManifest := &Manifest{Version: 1}
+			if tc.keepOldChunks {
+				legacyManifest.Chunks = expectedChunks
+			}
+			writeManifestFile(t, syncDir, legacyManifest)
+
+			result, err := sy.Export("alice", "project-a")
+			if err != nil {
+				t.Fatalf("export through legacy manifest: %v", err)
+			}
+			if !result.IsEmpty {
+				t.Fatalf("export result = %#v, want empty", result)
+			}
+			manifest, err = NewFileTransport(syncDir).ReadManifest()
+			if err != nil {
+				t.Fatalf("read upgraded manifest: %v", err)
+			}
+			if manifest.Version != ownershipModeManifestVersion {
+				t.Fatalf("manifest version = %d, want %d", manifest.Version, ownershipModeManifestVersion)
+			}
+			if tc.keepOldChunks && !reflect.DeepEqual(manifest.Chunks, expectedChunks) {
+				t.Fatalf("manifest chunks = %#v, want %#v", manifest.Chunks, expectedChunks)
+			}
+		})
+	}
+}
+
+func TestOwnershipManifestVersionUpgradeWriteFailureStopsBeforeChunkOrTracking(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSessionWithOwnershipMode("manual-save-project-a", "project-a", "/tmp/a", store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatalf("create project-owned session: %v", err)
+	}
+	wantErr := errors.New("forced early manifest write failure")
+	transport := newFakeCloudTransport()
+	transport.writeManifestErr = wantErr
+
+	_, err := NewWithTransport(s, transport).Export("alice", "project-a")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("export error = %v, want %v", err, wantErr)
+	}
+	if transport.writeManifestCalls != 1 {
+		t.Fatalf("write manifest calls = %d, want 1", transport.writeManifestCalls)
+	}
+	if transport.writeChunkCalls != 0 || len(transport.chunks) != 0 {
+		t.Fatalf("chunk writes = %d, chunks = %#v; want none", transport.writeChunkCalls, transport.chunks)
+	}
+	synced, err := s.GetSyncedChunks()
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if len(synced) != 0 {
+		t.Fatalf("synced chunks = %#v, want none", synced)
+	}
+}
+
+func TestSynthesizeMutationsFromChunkPreservesSessionOwnershipMode(t *testing.T) {
+	mutations := synthesizeMutationsFromChunk(ChunkData{Sessions: []store.Session{{
+		ID:            "manual-save-project-a",
+		Project:       "project-a",
+		OwnershipMode: store.SessionOwnershipProjectOwned,
+		Directory:     "/tmp/a",
+	}}})
+	if len(mutations) != 1 {
+		t.Fatalf("synthesized mutations = %#v, want one session mutation", mutations)
+	}
+	target := newTestStore(t)
+	mutations[0].Seq = 1
+	if err := target.ApplyPulledMutation(store.LocalChunkTargetKey, mutations[0]); err != nil {
+		t.Fatalf("apply synthesized session mutation: %v", err)
+	}
+	session, err := target.GetSession("manual-save-project-a")
+	if err != nil || session.OwnershipMode != store.SessionOwnershipProjectOwned {
+		t.Fatalf("round-tripped session = %#v, %v; want project_owned", session, err)
+	}
+}
+
+func TestImportBranches(t *testing.T) {
+	t.Run("read manifest error", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(syncDir, "manifest.json"), []byte("{bad"), 0o644); err != nil {
+			t.Fatalf("write invalid manifest: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "parse manifest") {
+			t.Fatalf("expected parse manifest error, got %v", err)
+		}
+	})
+
+	t.Run("empty manifest", func(t *testing.T) {
+		s := newTestStore(t)
+		sy := New(s, t.TempDir())
+
+		res, err := sy.Import()
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		if *res != (ImportResult{}) {
+			t.Fatalf("expected empty result, got %+v", res)
+		}
+	})
+
+	t.Run("missing chunk file is skipped", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		writeManifestFile(t, syncDir, &Manifest{
+			Version: 1,
+			Chunks:  []ChunkEntry{{ID: "missing", CreatedBy: "alice", CreatedAt: time.Now().UTC().Format(time.RFC3339)}},
+		})
+
+		sy := New(s, syncDir)
+		res, err := sy.Import()
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		if res.ChunksImported != 0 || res.ChunksSkipped != 1 {
+			t.Fatalf("expected one skipped chunk, got %+v", res)
+		}
+	})
+
+	t.Run("invalid chunk json", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		id := "badjson"
+		writeManifestFile(t, syncDir, &Manifest{
+			Version: 1,
+			Chunks:  []ChunkEntry{{ID: id, CreatedBy: "alice", CreatedAt: time.Now().UTC().Format(time.RFC3339)}},
+		})
+
+		chunksDir := filepath.Join(syncDir, "chunks")
+		if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+			t.Fatalf("mkdir chunks: %v", err)
+		}
+		if err := writeGzip(filepath.Join(chunksDir, id+".jsonl.gz"), []byte("{not-valid-json")); err != nil {
+			t.Fatalf("write bad gzip chunk: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "parse chunk") {
+			t.Fatalf("expected parse chunk error, got %v", err)
+		}
+	})
+
+	t.Run("store import error", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		id := "broken"
+		writeManifestFile(t, syncDir, &Manifest{
+			Version: 1,
+			Chunks:  []ChunkEntry{{ID: id, CreatedBy: "alice", CreatedAt: time.Now().UTC().Format(time.RFC3339)}},
+		})
+
+		chunk := ChunkData{
+			Mutations: []store.SyncMutation{{
+				Entity:    "unknown",
+				EntityKey: "broken-entity",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{}`,
+			}},
+		}
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("marshal chunk: %v", err)
+		}
+
+		chunksDir := filepath.Join(syncDir, "chunks")
+		if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+			t.Fatalf("mkdir chunks: %v", err)
+		}
+		if err := writeGzip(filepath.Join(chunksDir, id+".jsonl.gz"), payload); err != nil {
+			t.Fatalf("write gzip chunk: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "dependency-safe local import stalled") || !strings.Contains(err.Error(), "unknown sync entity") {
+			t.Fatalf("expected dependency-safe local import error, got %v", err)
+		}
+	})
+
+	t.Run("get synced chunks", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "c1", CreatedAt: time.Now().UTC().Format(time.RFC3339)}}})
+		if err := s.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "get synced chunks") {
+			t.Fatalf("expected get synced chunks error, got %v", err)
+		}
+	})
+
+	t.Run("record chunk error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		id := "okchunk"
+		writeManifestFile(t, syncDir, &Manifest{
+			Version: 1,
+			Chunks:  []ChunkEntry{{ID: id, CreatedBy: "alice", CreatedAt: "2025-01-01T00:00:00Z"}},
+		})
+
+		chunk := ChunkData{
+			Sessions: []store.Session{{ID: "s1", Project: "p", Directory: "/tmp", StartedAt: "2025-01-01 00:00:00"}},
+		}
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatalf("marshal chunk: %v", err)
+		}
+		chunksDir := filepath.Join(syncDir, "chunks")
+		if err := os.MkdirAll(chunksDir, 0o755); err != nil {
+			t.Fatalf("mkdir chunks: %v", err)
+		}
+		if err := writeGzip(filepath.Join(chunksDir, id+".jsonl.gz"), payload); err != nil {
+			t.Fatalf("write gzip chunk: %v", err)
+		}
+
+		storeApplyPulledChunk = func(_ *store.Store, _, _ string, _ []store.SyncMutation) error {
+			return errors.New("forced apply pulled chunk fail")
+		}
+
+		sy := New(s, syncDir)
+		if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "dependency-safe local import stalled") || !strings.Contains(err.Error(), "forced apply pulled chunk fail") {
+			t.Fatalf("expected apply pulled chunk import error, got %v", err)
+		}
+	})
+}
+
+func TestLocalImportDependencySafeAcrossChunksRegardlessManifestOrder(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	project := "proj-a"
+
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{
+		{ID: "chunk-dependent", CreatedAt: "2025-01-02T00:00:00Z"},
+		{ID: "chunk-session", CreatedAt: "2025-01-01T00:00:00Z"},
+	}})
+	writeLocalChunkFile(t, syncDir, "chunk-dependent", ChunkData{
+		Observations: []store.Observation{{SyncID: "obs-cross-chunk", SessionID: "sess-cross-chunk", Type: "note", Title: "cross", Content: "cross chunk observation", Project: &project, Scope: "project", CreatedAt: "2025-01-02 00:00:00", UpdatedAt: "2025-01-02 00:00:00"}},
+		Prompts:      []store.Prompt{{SyncID: "prompt-cross-chunk", SessionID: "sess-cross-chunk", Content: "cross chunk prompt", Project: project, CreatedAt: "2025-01-02 00:01:00"}},
+	})
+	writeLocalChunkFile(t, syncDir, "chunk-session", ChunkData{
+		Sessions: []store.Session{{ID: "sess-cross-chunk", Project: project, Directory: "/tmp/proj-a", StartedAt: "2025-01-01 00:00:00"}},
+	})
+
+	res, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("local import should retry dependency chunks safely: %v", err)
+	}
+	if res.ChunksImported != 2 || res.SessionsImported != 1 || res.ObservationsImported != 1 || res.PromptsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", res)
+	}
+	sess, err := s.GetSession("sess-cross-chunk")
+	if err != nil {
+		t.Fatalf("expected session imported: %v", err)
+	}
+	if sess.Directory != "/tmp/proj-a" {
+		t.Fatalf("expected real session chunk to win, got %+v", sess)
+	}
+	results, err := s.Search("cross chunk observation", store.SearchOptions{Project: project, Limit: 5})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("expected imported observation, results=%d err=%v", len(results), err)
+	}
+	prompts, err := s.RecentPrompts(project, 5)
+	if err != nil || len(prompts) != 1 {
+		t.Fatalf("expected imported prompt, prompts=%d err=%v", len(prompts), err)
+	}
+}
+
+func TestLocalImportHandlesRelationEndpointFailuresWithoutStalling(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		mutations     []store.SyncMutation
+		assertApplied func(t *testing.T, s *store.Store)
+		deferred      int
+	}{
+		{
+			name: "self-referential relation applies when its observation exists",
+			mutations: []store.SyncMutation{
+				{Entity: store.SyncEntityRelation, EntityKey: "rel-self", Op: store.SyncOpUpsert, Payload: `{"sync_id":"rel-self","source_id":"obs-self","target_id":"obs-self","relation":"compatible","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a","created_at":"2026-08-25T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`},
+				{Entity: store.SyncEntityObservation, EntityKey: "obs-self", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-self","session_id":"sess-relations","type":"decision","title":"self","content":"self relation endpoint","project":"proj-a","scope":"project"}`},
+				{Entity: store.SyncEntitySession, EntityKey: "sess-relations", Op: store.SyncOpUpsert, Payload: `{"id":"sess-relations","project":"proj-a","directory":"/tmp/proj-a"}`},
+			},
+			assertApplied: func(t *testing.T, s *store.Store) {
+				t.Helper()
+				relation, err := s.GetRelation("rel-self")
+				if err != nil {
+					t.Fatalf("expected self-referential relation to import: %v", err)
+				}
+				if relation.SourceID != "obs-self" || relation.TargetID != "obs-self" {
+					t.Fatalf("unexpected self-referential relation: %+v", relation)
+				}
+			},
+		},
+		{
+			name: "missing endpoint relation defers while the chunk imports",
+			mutations: []store.SyncMutation{
+				{Entity: store.SyncEntityRelation, EntityKey: "rel-orphan", Op: store.SyncOpUpsert, Payload: `{"sync_id":"rel-orphan","source_id":"obs-present","target_id":"obs-never-exported","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a","created_at":"2026-08-25T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`},
+				{Entity: store.SyncEntityObservation, EntityKey: "obs-present", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-present","session_id":"sess-relations","type":"decision","title":"present","content":"available relation endpoint","project":"proj-a","scope":"project"}`},
+				{Entity: store.SyncEntitySession, EntityKey: "sess-relations", Op: store.SyncOpUpsert, Payload: `{"id":"sess-relations","project":"proj-a","directory":"/tmp/proj-a"}`},
+			},
+			assertApplied: func(t *testing.T, s *store.Store) {
+				t.Helper()
+				if _, err := s.GetObservationBySyncID("obs-present"); err != nil {
+					t.Fatalf("expected available relation endpoint to import: %v", err)
+				}
+				if _, err := s.GetRelation("rel-orphan"); err == nil {
+					t.Fatal("expected unresolved relation to remain unapplied")
+				}
+			},
+			deferred: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStore(t)
+			syncDir := t.TempDir()
+			chunkID := "chunk-relation-" + strings.ReplaceAll(tt.name, " ", "-")
+			writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-08-25T00:00:00Z"}}})
+			writeLocalChunkFile(t, syncDir, chunkID, ChunkData{Mutations: tt.mutations})
+
+			result, err := New(s, syncDir).Import()
+			if err != nil {
+				t.Fatalf("local import should not stall on relation endpoint failures: %v", err)
+			}
+			if result.ChunksImported != 1 {
+				t.Fatalf("expected one imported chunk, got %+v", result)
+			}
+			tt.assertApplied(t, s)
+
+			deferred, dead, err := s.CountDeferredAndDead()
+			if err != nil {
+				t.Fatalf("count deferred and dead relations: %v", err)
+			}
+			if deferred != tt.deferred || dead != 0 {
+				t.Fatalf("unexpected deferred state: deferred=%d dead=%d", deferred, dead)
+			}
+			synced, err := s.GetSyncedChunks()
+			if err != nil {
+				t.Fatalf("get synced chunks: %v", err)
+			}
+			if !synced[chunkID] {
+				t.Fatalf("expected chunk %q to be marked synced", chunkID)
+			}
+		})
+	}
+}
+
+func TestLocalImportReplaysDeferredRelationAfterReverseOrderedChunks(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{
+		{ID: "chunk-relation-first", CreatedAt: "2026-08-25T00:00:00Z"},
+		{ID: "chunk-endpoints-second", CreatedAt: "2026-08-25T00:01:00Z"},
+	}})
+	writeLocalChunkFile(t, syncDir, "chunk-relation-first", ChunkData{Mutations: []store.SyncMutation{{
+		Entity: store.SyncEntityRelation, EntityKey: "rel-cross-chunk", Op: store.SyncOpUpsert,
+		Payload: `{"sync_id":"rel-cross-chunk","source_id":"obs-cross-source","target_id":"obs-cross-target","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a"}`,
+	}}})
+	writeLocalChunkFile(t, syncDir, "chunk-endpoints-second", ChunkData{Mutations: []store.SyncMutation{
+		{Entity: store.SyncEntitySession, EntityKey: "sess-cross-chunk", Op: store.SyncOpUpsert, Payload: `{"id":"sess-cross-chunk","project":"proj-a","directory":"/tmp/proj-a"}`},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-cross-source", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-cross-source","session_id":"sess-cross-chunk","type":"decision","title":"source","content":"source endpoint","project":"proj-a","scope":"project"}`},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-cross-target", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-cross-target","session_id":"sess-cross-chunk","type":"decision","title":"target","content":"target endpoint","project":"proj-a","scope":"project"}`},
+	}})
+
+	result, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if result.ChunksImported != 2 || result.RelationsReplayed != 1 || result.RelationsDeferred != 0 || result.RelationsDead != 0 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if _, err := s.GetRelation("rel-cross-chunk"); err != nil {
+		t.Fatalf("expected deferred relation to replay after endpoint chunk: %v", err)
+	}
+}
+
+func TestLocalImportReplaysDeferredRelationWithoutNewChunks(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "chunk-missing-target", CreatedAt: "2026-08-25T00:00:00Z"}}})
+	writeLocalChunkFile(t, syncDir, "chunk-missing-target", ChunkData{Mutations: []store.SyncMutation{
+		{Entity: store.SyncEntitySession, EntityKey: "sess-no-new-chunks", Op: store.SyncOpUpsert, Payload: `{"id":"sess-no-new-chunks","project":"proj-a","directory":"/tmp/proj-a"}`},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-present", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-present","session_id":"sess-no-new-chunks","type":"decision","title":"present","content":"available endpoint","project":"proj-a","scope":"project"}`},
+		{Entity: store.SyncEntityRelation, EntityKey: "rel-no-new-chunks", Op: store.SyncOpUpsert, Payload: `{"sync_id":"rel-no-new-chunks","source_id":"obs-present","target_id":"obs-arrives-without-chunk","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a"}`},
+	}})
+
+	if _, err := New(s, syncDir).Import(); err != nil {
+		t.Fatalf("initial Import: %v", err)
+	}
+	if err := s.ApplyPulledMutation(store.LocalChunkTargetKey, store.SyncMutation{
+		Seq: 4, Entity: store.SyncEntityObservation, EntityKey: "obs-arrives-without-chunk", Op: store.SyncOpUpsert,
+		Payload: `{"sync_id":"obs-arrives-without-chunk","session_id":"sess-no-new-chunks","type":"decision","title":"arrived","content":"arrived outside chunks","project":"proj-a","scope":"project"}`,
+	}); err != nil {
+		t.Fatalf("apply arriving endpoint: %v", err)
+	}
+
+	result, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("Import without new chunks: %v", err)
+	}
+	if result.ChunksImported != 0 || result.ChunksSkipped != 1 || result.RelationsReplayed != 1 || result.RelationsDeferred != 0 || result.RelationsDead != 0 {
+		t.Fatalf("unexpected no-new-chunks import result: %+v", result)
+	}
+	if _, err := s.GetRelation("rel-no-new-chunks"); err != nil {
+		t.Fatalf("expected deferred relation to replay without new chunks: %v", err)
+	}
+}
+
+func TestLocalImportMarksMismatchedRelationIdentityDead(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "chunk-mismatched-relation", CreatedAt: "2026-08-25T00:00:00Z"}}})
+	writeLocalChunkFile(t, syncDir, "chunk-mismatched-relation", ChunkData{Mutations: []store.SyncMutation{{
+		Entity: store.SyncEntityRelation, EntityKey: "rel-entity-key", Op: store.SyncOpUpsert,
+		Payload: `{"sync_id":"rel-payload-id","source_id":"obs-missing-a","target_id":"obs-missing-b","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a"}`,
+	}}})
+
+	result, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if result.RelationsReplayed != 0 || result.RelationsDeferred != 0 || result.RelationsDead != 1 {
+		t.Fatalf("unexpected identity mismatch result: %+v", result)
+	}
+	deferred, dead, err := s.CountDeferredAndDead()
+	if err != nil {
+		t.Fatalf("count deferred and dead: %v", err)
+	}
+	if deferred != 0 || dead != 1 {
+		t.Fatalf("identity mismatch must be terminal, got deferred=%d dead=%d", deferred, dead)
+	}
+}
+
+func TestLocalImportOrdersExplicitMutationsAndDirectArraysSafely(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	project := "proj-a"
+	chunkID := "mixed-local"
+
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2025-01-01T00:00:00Z"}}})
+	writeLocalChunkFile(t, syncDir, chunkID, ChunkData{
+		Sessions:     []store.Session{{ID: "sess-mixed", Project: project, Directory: "/tmp/proj-a", StartedAt: "2025-01-01 00:00:00"}},
+		Observations: []store.Observation{{SyncID: "obs-direct-mixed", SessionID: "sess-mixed", Type: "note", Title: "direct", Content: "direct local observation", Project: &project, Scope: "project", CreatedAt: "2025-01-01 00:01:00", UpdatedAt: "2025-01-01 00:01:00"}},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityPrompt,
+			EntityKey: "prompt-explicit-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"prompt-explicit-mixed","session_id":"sess-mixed","content":"explicit prompt after session","project":"proj-a","created_at":"2025-01-01 00:02:00"}`,
+		}},
+	})
+
+	if _, err := New(s, syncDir).Import(); err != nil {
+		t.Fatalf("local import should order synthesized sessions before direct and explicit dependents: %v", err)
+	}
+	if _, err := s.GetSession("sess-mixed"); err != nil {
+		t.Fatalf("expected mixed session imported: %v", err)
+	}
+	results, err := s.Search("direct local observation", store.SearchOptions{Project: project, Limit: 5})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("expected direct observation, results=%d err=%v", len(results), err)
+	}
+	prompts, err := s.RecentPrompts(project, 5)
+	if err != nil || len(prompts) != 1 || prompts[0].SyncID != "prompt-explicit-mixed" {
+		t.Fatalf("expected explicit prompt imported, prompts=%+v err=%v", prompts, err)
+	}
+}
+
+func TestLocalImportRecoversLegacyChunkWithMissingSessionStub(t *testing.T) {
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	chunkID := "aaf7a13f"
+	project := "proj-a"
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2025-01-01T00:00:00Z"}}})
+	writeLocalChunkFile(t, syncDir, chunkID, ChunkData{
+		Observations: []store.Observation{{SyncID: "obs-missing-session", SessionID: "does-not-exist", Type: "note", Title: "missing", Content: "missing dependency", Project: &project, Scope: "project", CreatedAt: "2025-01-01 00:00:00", UpdatedAt: "2025-01-01 00:00:00"}},
+		Prompts:      []store.Prompt{{SyncID: "prompt-missing-session", SessionID: "does-not-exist", Content: "prompt should be preserved", Project: project, CreatedAt: "2025-01-01 00:00:01"}},
+	})
+
+	res, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("local import should recover malformed legacy missing session chunk: %v", err)
+	}
+	if res.ChunksImported != 1 || res.SessionsImported != 1 || res.ObservationsImported != 1 || res.PromptsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", res)
+	}
+	sess, err := s.GetSession("does-not-exist")
+	if err != nil {
+		t.Fatalf("expected recovered stub session: %v", err)
+	}
+	if sess.Project != project || sess.Directory != "(recovered-missing-session)" {
+		t.Fatalf("unexpected recovered session: %+v", sess)
+	}
+	results, err := s.Search("missing dependency", store.SearchOptions{Project: project, Limit: 5})
+	if err != nil || len(results) != 1 {
+		t.Fatalf("expected recovered observation, results=%d err=%v", len(results), err)
+	}
+	prompts, err := s.RecentPrompts(project, 5)
+	if err != nil || len(prompts) != 1 || prompts[0].SyncID != "prompt-missing-session" {
+		t.Fatalf("expected recovered prompt, prompts=%+v err=%v", prompts, err)
+	}
+}
+
+func TestLocalImportSkipsAlreadyImportedChunksIdempotently(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	chunkID := "idempotent-local"
+	writeManifestFile(t, syncDir, &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2025-01-01T00:00:00Z"}}})
+	writeLocalChunkFile(t, syncDir, chunkID, ChunkData{Sessions: []store.Session{{ID: "sess-idempotent", Project: "proj-a", Directory: "/tmp/proj-a", StartedAt: "2025-01-01 00:00:00"}}})
+
+	if _, err := New(s, syncDir).Import(); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	applyCalls := 0
+	storeApplyPulledChunk = func(_ *store.Store, _, _ string, _ []store.SyncMutation) error {
+		applyCalls++
+		return errors.New("already imported chunks should not be applied")
+	}
+	res, err := New(s, syncDir).Import()
+	if err != nil {
+		t.Fatalf("second import should skip known chunk: %v", err)
+	}
+	if res.ChunksImported != 0 || res.ChunksSkipped != 1 || applyCalls != 0 {
+		t.Fatalf("expected idempotent skip without apply, result=%+v applyCalls=%d", res, applyCalls)
+	}
+}
+
+func TestManifestReadWrite(t *testing.T) {
+	syncDir := t.TempDir()
+	sy := New(nil, syncDir)
+
+	missing, err := sy.readManifest()
+	if err != nil {
+		t.Fatalf("read missing manifest: %v", err)
+	}
+	if missing.Version != 1 || len(missing.Chunks) != 0 {
+		t.Fatalf("unexpected default manifest: %+v", missing)
+	}
+
+	want := &Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: "abc12345", CreatedBy: "alice", CreatedAt: "2025-01-01T00:00:00Z", Sessions: 1, Memories: 2, Prompts: 3}},
+	}
+	if err := sy.writeManifest(want); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	got, err := sy.readManifest()
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if len(got.Chunks) != 1 || got.Chunks[0].ID != want.Chunks[0].ID || got.Chunks[0].Memories != 2 {
+		t.Fatalf("manifest roundtrip mismatch: %+v", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(syncDir, "manifest.json"), []byte("{"), 0o644); err != nil {
+		t.Fatalf("write invalid manifest: %v", err)
+	}
+	if _, err := sy.readManifest(); err == nil || !strings.Contains(err.Error(), "parse manifest") {
+		t.Fatalf("expected parse manifest error, got %v", err)
+	}
+
+	badSyncPath := filepath.Join(t.TempDir(), "not-dir")
+	if err := os.WriteFile(badSyncPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write non-dir sync path: %v", err)
+	}
+	syBad := New(nil, badSyncPath)
+	if _, err := syBad.readManifest(); err == nil || !strings.Contains(err.Error(), "read manifest") {
+		t.Fatalf("expected read manifest error, got %v", err)
+	}
+	if err := syBad.writeManifest(&Manifest{Version: 1}); err == nil {
+		t.Fatal("expected write manifest error for non-directory sync path")
+	}
+
+	t.Run("marshal manifest error", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		sy := New(nil, t.TempDir())
+		jsonMarshalManifest = func(v any, prefix, indent string) ([]byte, error) {
+			_ = v
+			_ = prefix
+			_ = indent
+			return nil, errors.New("forced manifest marshal error")
+		}
+
+		if err := sy.writeManifest(&Manifest{Version: 1}); err == nil || !strings.Contains(err.Error(), "marshal manifest") {
+			t.Fatalf("expected marshal manifest error, got %v", err)
+		}
+	})
+}
+
+func TestStatus(t *testing.T) {
+	t.Run("read manifest error", func(t *testing.T) {
+		s := newTestStore(t)
+		syncDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(syncDir, "manifest.json"), []byte("not-json"), 0o644); err != nil {
+			t.Fatalf("write invalid manifest: %v", err)
+		}
+
+		sy := New(s, syncDir)
+		if _, _, _, err := sy.Status(); err == nil {
+			t.Fatal("expected status to fail on invalid manifest")
+		}
+	})
+
+	s := newTestStore(t)
+	syncDir := t.TempDir()
+	sy := New(s, syncDir)
+
+	if err := sy.writeManifest(&Manifest{
+		Version: 1,
+		Chunks:  []ChunkEntry{{ID: "c1", CreatedAt: "2025-01-01T00:00:00Z"}, {ID: "c2", CreatedAt: "2025-01-02T00:00:00Z"}},
+	}); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := s.RecordSyncedChunk("c1"); err != nil {
+		t.Fatalf("record synced chunk: %v", err)
+	}
+
+	local, remote, pending, err := sy.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if local != 1 || remote != 2 || pending != 1 {
+		t.Fatalf("unexpected status values: local=%d remote=%d pending=%d", local, remote, pending)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if _, _, _, err := sy.Status(); err == nil {
+		t.Fatal("expected status error with closed store")
+	}
+}
+
+func TestCloudSyncPreflightBlocksUnenrolledBeforeTransport(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if _, err := sy.Export("alice", "proj-a"); err == nil || !strings.Contains(err.Error(), "blocked_unenrolled") {
+		t.Fatalf("expected blocked_unenrolled error, got %v", err)
+	}
+
+	if transport.readManifestCalls != 0 || transport.writeChunkCalls != 0 {
+		t.Fatalf("expected no transport calls before preflight passes, got readManifest=%d writeChunk=%d", transport.readManifestCalls, transport.writeChunkCalls)
+	}
+
+	state, err := s.GetSyncState("cloud:proj-a")
+	if err != nil {
+		t.Fatalf("get sync state: %v", err)
+	}
+	if state.ReasonCode == nil || *state.ReasonCode != "blocked_unenrolled" {
+		t.Fatalf("expected reason_code blocked_unenrolled, got %v", state.ReasonCode)
+	}
+}
+
+func TestCloudSyncPreflightRequiresExplicitProjectScope(t *testing.T) {
+	s := newTestStore(t)
+	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "")
+
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "explicit --project") {
+		t.Fatalf("expected explicit project scope error, got %v", err)
+	}
+}
+
+func TestCloudSyncEnrolledExportImportAndIdempotentPull(t *testing.T) {
+	srcStore := newTestStore(t)
+	seedStoreForSync(t, srcStore)
+	if err := srcStore.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll src project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	exporter := NewCloudWithTransport(srcStore, transport, "proj-a")
+
+	exportResult, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if exportResult.IsEmpty {
+		t.Fatal("expected non-empty cloud export for enrolled project")
+	}
+
+	dstStore := newTestStore(t)
+	if err := dstStore.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll dst project: %v", err)
+	}
+	importer := NewCloudWithTransport(dstStore, transport, "proj-a")
+
+	importResult, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+	if importResult.ChunksImported != 1 {
+		t.Fatalf("expected one imported chunk, got %+v", importResult)
+	}
+
+	importAgain, err := importer.Import()
+	if err != nil {
+		t.Fatalf("second cloud import: %v", err)
+	}
+	if importAgain.ChunksImported != 0 || importAgain.ChunksSkipped != 1 {
+		t.Fatalf("expected idempotent second import, got %+v", importAgain)
+	}
+}
+
+func TestCloudExportRepairsEnrolledJournalBeforeListingMutations(t *testing.T) {
+	s := newTestStore(t)
+	seedStoreForSync(t, s)
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM sync_mutations WHERE project = ?`, "proj-a"); err != nil {
+		t.Fatalf("remove journal entries to simulate legacy store: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	result, err := NewCloudWithTransport(s, transport, "proj-a").Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if result.IsEmpty || result.MutationsExported != 3 {
+		t.Fatalf("export result = %+v, want three repaired mutations", result)
+	}
+	if transport.writeChunkCalls != 1 {
+		t.Fatalf("write chunk calls = %d, want 1", transport.writeChunkCalls)
+	}
+}
+
+func TestCloudExportUsesMutationJournalForUpdatesAndDeletes(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	updatedTitle := "updated"
+	if _, err := s.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("delete observation: %v", err)
+	}
+
+	result, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export with mutation journal: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatal("expected mutation-backed export to include updates/deletes")
+	}
+
+	payload, ok := transport.chunks[result.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", result.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Observations) != 1 {
+		t.Fatalf("expected one mutated observation in chunk, got %d", len(chunk.Observations))
+	}
+	if chunk.Observations[0].DeletedAt == nil {
+		t.Fatalf("expected deleted_at tombstone in exported observation, got %+v", chunk.Observations[0])
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected mutation journal to be acked after cloud export, got %+v", pending)
+	}
+}
+
+func TestCloudExportWritesMutationOnlyChunkForHardDeletes(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	if err := s.DeleteObservation(obsID, true); err != nil {
+		t.Fatalf("hard delete observation: %v", err)
+	}
+
+	second, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected mutation-only cloud export to write a chunk")
+	}
+	if second.MutationsExported == 0 {
+		t.Fatalf("expected mutation-backed export counter to be non-zero, got %+v", second)
+	}
+	if second.SessionsExported != 0 || second.ObservationsExported != 0 || second.PromptsExported != 0 {
+		t.Fatalf("expected mutation-only export to keep entity snapshot counters at zero, got %+v", second)
+	}
+
+	payload, ok := transport.chunks[second.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", second.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Observations) != 0 {
+		t.Fatalf("expected mutation-only chunk without observations, got %d", len(chunk.Observations))
+	}
+	if len(chunk.Mutations) == 0 {
+		t.Fatalf("expected mutation-only chunk to include mutation journal payload")
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected pending mutations to be acked only after chunk write, got %+v", pending)
+	}
+}
+
+func TestCloudExportKnownChunkReconcileFailureDoesNotAckMutations(t *testing.T) {
+	resetSyncTestHooks(t)
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	updatedTitle := "updated"
+	if _, err := s.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+
+	projectData, err := s.ExportProject("proj-a")
+	if err != nil {
+		t.Fatalf("export project data: %v", err)
+	}
+	chunk, seqs, err := sy.filterByPendingMutations(projectData, "proj-a")
+	if err != nil {
+		t.Fatalf("filter by pending mutations: %v", err)
+	}
+	if len(seqs) == 0 {
+		t.Fatal("expected pending mutation seqs")
+	}
+
+	chunkJSON, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal chunk: %v", err)
+	}
+	chunkJSON, err = chunkcodec.CanonicalizeForProject(chunkJSON, "proj-a")
+	if err != nil {
+		t.Fatalf("canonicalize chunk: %v", err)
+	}
+	knownChunkID := chunkcodec.ChunkID(chunkJSON)
+	transport.manifest.Chunks = append(transport.manifest.Chunks, ChunkEntry{ID: knownChunkID, CreatedBy: "remote", CreatedAt: time.Now().UTC().Format(time.RFC3339)})
+
+	ackCalls := 0
+	storeAckMutationSeq = func(storeRef *store.Store, targetKey string, seqs []int64) error {
+		ackCalls++
+		return storeRef.AckSyncMutationSeqs(targetKey, seqs)
+	}
+	storeRecordSynced = func(_ *store.Store, targetKey, chunkID string) error {
+		if chunkID == knownChunkID {
+			return errors.New("forced record failure")
+		}
+		return s.RecordSyncedChunkForTarget(targetKey, chunkID)
+	}
+
+	_, err = sy.Export("alice", "proj-a")
+	if err == nil || !strings.Contains(err.Error(), "reconcile synced chunk") {
+		t.Fatalf("expected reconcile synced chunk error, got %v", err)
+	}
+	if ackCalls != 0 {
+		t.Fatalf("expected mutation ack to be skipped when reconcile fails, got %d calls", ackCalls)
+	}
+
+	pending, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatal("expected pending mutation journal to remain after reconcile failure")
+	}
+}
+
+func TestCloudExportHardDeleteWithEmptyEntityProjectUsesSessionProjectScope(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "initial",
+		Content:   "v1",
+		Project:   "",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	first, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first export to create initial chunk")
+	}
+
+	if err := s.DeleteObservation(obsID, true); err != nil {
+		t.Fatalf("hard delete observation: %v", err)
+	}
+
+	second, err := sy.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected hard delete mutation export even when entity project is empty")
+	}
+
+	payload, ok := transport.chunks[second.ChunkID]
+	if !ok {
+		t.Fatalf("expected chunk payload for id %s", second.ChunkID)
+	}
+	var chunk ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode chunk payload: %v", err)
+	}
+	if len(chunk.Mutations) == 0 {
+		t.Fatalf("expected mutation-only chunk to include delete mutation")
+	}
+}
+
+func TestCloudImportAppliesMutationReconciliationForUpdatesAndDeletes(t *testing.T) {
+	src := newTestStore(t)
+	transport := newFakeCloudTransport()
+	exporter := NewCloudWithTransport(src, transport, "proj-a")
+
+	if err := src.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll source project: %v", err)
+	}
+	if err := src.CreateSession("sess-a", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := src.AddObservation(store.AddObservationParams{
+		SessionID: "sess-a",
+		Type:      "decision",
+		Title:     "v1",
+		Content:   "original",
+		Project:   "proj-a",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	promptID, err := src.AddPrompt(store.AddPromptParams{SessionID: "sess-a", Content: "to-delete", Project: "proj-a"})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	first, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("first cloud export: %v", err)
+	}
+	if first.IsEmpty {
+		t.Fatal("expected first cloud export to write initial snapshot")
+	}
+
+	updatedTitle := "v2"
+	if _, err := src.UpdateObservation(obsID, store.UpdateObservationParams{Title: &updatedTitle}); err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+	if err := src.DeletePrompt(promptID); err != nil {
+		t.Fatalf("delete prompt: %v", err)
+	}
+
+	second, err := exporter.Export("alice", "proj-a")
+	if err != nil {
+		t.Fatalf("second cloud export: %v", err)
+	}
+	if second.IsEmpty {
+		t.Fatal("expected second cloud export to include follow-up mutations")
+	}
+
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+
+	if _, err := importer.Import(); err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+
+	// Resolve by content/title since sync id is generated internally.
+	found, err := dst.Search("v2", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search updated observation: %v", err)
+	}
+	if len(found) == 0 || found[0].Title != "v2" {
+		t.Fatalf("expected updated observation title after pull reconciliation, got %+v", found)
+	}
+
+	prompts, err := dst.RecentPrompts("proj-a", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	for _, p := range prompts {
+		if p.Content == "to-delete" {
+			t.Fatalf("expected deleted prompt to remain deleted after cloud pull, prompts=%+v", prompts)
+		}
+	}
+}
+
+func TestCloudImportChunkApplyIsAtomicOnFailure(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-atomic"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: time.Now().UTC().Format(time.RFC3339)}}}
+
+	badChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "remote-sess",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"remote-sess","project":"proj-a","directory":"/remote"}`,
+		},
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-bad",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-bad","session_id":"missing-session","type":"note","title":"bad","content":"fails fk","project":"proj-a","scope":"project"}`,
+		},
+	}}
+	badPayload, err := json.Marshal(badChunk)
+	if err != nil {
+		t.Fatalf("marshal bad chunk: %v", err)
+	}
+	transport.chunks[chunkID] = badPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	if _, err := importer.Import(); err == nil {
+		t.Fatal("expected cloud import failure for invalid mutation chunk")
+	}
+
+	if _, err := dst.GetSession("remote-sess"); err == nil {
+		t.Fatal("expected remote session mutation to be rolled back after failed chunk import")
+	}
+	synced, err := dst.GetSyncedChunks()
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if synced[chunkID] {
+		t.Fatalf("failed chunk %q must not be marked synced", chunkID)
+	}
+}
+
+func TestCloudImportReordersChunksToEstablishSessionsBeforeDependents(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	obsFirstID := "chunk-observation-first"
+	sessionSecondID := "chunk-session-second"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{
+		{ID: obsFirstID, CreatedAt: "2026-04-10T10:00:00Z"},
+		{ID: sessionSecondID, CreatedAt: "2026-04-10T11:00:00Z"},
+	}}
+
+	obsChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-needs-session",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-needs-session","session_id":"sess-bootstrap","type":"note","title":"boot","content":"depends on session","project":"proj-a","scope":"project"}`,
+		},
+	}}
+	obsPayload, err := json.Marshal(obsChunk)
+	if err != nil {
+		t.Fatalf("marshal observation-first chunk: %v", err)
+	}
+	transport.chunks[obsFirstID] = obsPayload
+
+	sessionChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-bootstrap",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-bootstrap","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	sessionPayload, err := json.Marshal(sessionChunk)
+	if err != nil {
+		t.Fatalf("marshal session chunk: %v", err)
+	}
+	transport.chunks[sessionSecondID] = sessionPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	result, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import should succeed after dependency-safe ordering: %v", err)
+	}
+	if result.ChunksImported != 2 {
+		t.Fatalf("expected both chunks imported, got %+v", result)
+	}
+
+	if _, err := dst.GetSession("sess-bootstrap"); err != nil {
+		t.Fatalf("expected session imported before dependent observation apply: %v", err)
+	}
+	results, err := dst.Search("depends on session", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected dependent observation to import successfully")
+	}
+}
+
+func TestCloudImportReordersMutationsWithinChunkToAvoidFKFailures(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-mixed-order"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-04-10T10:00:00Z"}}}
+
+	mixedChunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-mixed","session_id":"sess-mixed","type":"note","title":"mixed","content":"chunk needs reorder","project":"proj-a","scope":"project"}`,
+		},
+		{
+			Entity:    store.SyncEntityPrompt,
+			EntityKey: "prompt-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"prompt-mixed","session_id":"sess-mixed","content":"prompt depends on session","project":"proj-a"}`,
+		},
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-mixed",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-mixed","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	chunkPayload, err := json.Marshal(mixedChunk)
+	if err != nil {
+		t.Fatalf("marshal mixed chunk: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	result, err := importer.Import()
+	if err != nil {
+		t.Fatalf("cloud import should reorder mixed chunk mutations safely: %v", err)
+	}
+	if result.ChunksImported != 1 {
+		t.Fatalf("expected one imported chunk, got %+v", result)
+	}
+
+	if _, err := dst.GetSession("sess-mixed"); err != nil {
+		t.Fatalf("expected session to be imported: %v", err)
+	}
+	results, err := dst.Search("chunk needs reorder", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected dependent observation to import successfully")
+	}
+}
+
+func TestCloudImportAppliesObservationsBeforeEarlierRelationInSameChunk(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-relation-before-observations"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-08-24T12:00:00Z"}}}
+	chunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-before-observations",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"rel-before-observations","source_id":"obs-relation-source","target_id":"obs-relation-target","relation":"compatible","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a","created_at":"2026-08-24T12:00:00Z","updated_at":"2026-08-24T12:00:00Z"}`,
+		},
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-relation-source",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-relation-source","session_id":"sess-relation-order","type":"decision","title":"source","content":"source observation","project":"proj-a","scope":"project"}`,
+		},
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-relation-target",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-relation-target","session_id":"sess-relation-order","type":"decision","title":"target","content":"target observation","project":"proj-a","scope":"project"}`,
+		},
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-relation-order",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-relation-order","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	chunkPayload, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal relation-first chunk: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	result, err := NewCloudWithTransport(dst, transport, "proj-a").Import()
+	if err != nil {
+		t.Fatalf("cloud import should apply observations before an earlier relation: %v", err)
+	}
+	if result.ChunksImported != 1 || result.ObservationsImported != 2 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	for _, syncID := range []string{"obs-relation-source", "obs-relation-target"} {
+		if _, err := dst.GetObservationBySyncID(syncID); err != nil {
+			t.Fatalf("expected referenced observation %q to be imported: %v", syncID, err)
+		}
+	}
+	relation, err := dst.GetRelation("rel-before-observations")
+	if err != nil {
+		t.Fatalf("expected relation to be imported: %v", err)
+	}
+	if relation.SourceID != "obs-relation-source" || relation.TargetID != "obs-relation-target" {
+		t.Fatalf("unexpected imported relation: %+v", relation)
+	}
+}
+
+func TestCloudImportDefersRelationWhenEndpointIsMissing(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-relation-missing-endpoint"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-08-24T12:00:00Z"}}}
+	chunk := ChunkData{Mutations: []store.SyncMutation{
+		{
+			Entity:    store.SyncEntityRelation,
+			EntityKey: "rel-missing-endpoint",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"rel-missing-endpoint","source_id":"obs-rollback-source","target_id":"obs-missing-target","relation":"compatible","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"proj-a","created_at":"2026-08-24T12:00:00Z","updated_at":"2026-08-24T12:00:00Z"}`,
+		},
+		{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-rollback-source",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-rollback-source","session_id":"sess-relation-rollback","type":"decision","title":"source","content":"source observation","project":"proj-a","scope":"project"}`,
+		},
+		{
+			Entity:    store.SyncEntitySession,
+			EntityKey: "sess-relation-rollback",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"id":"sess-relation-rollback","project":"proj-a","directory":"/tmp/proj-a"}`,
+		},
+	}}
+	chunkPayload, err := json.Marshal(chunk)
+	if err != nil {
+		t.Fatalf("marshal relation-first chunk with missing endpoint: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	if _, err := dst.GetObservationBySyncID("obs-missing-target"); err == nil {
+		t.Fatal("missing relation target must be absent from the destination before import")
+	}
+	result, err := NewCloudWithTransport(dst, transport, "proj-a").Import()
+	if err != nil {
+		t.Fatalf("import should defer the missing relation endpoint, got %v", err)
+	}
+	if result.ChunksImported != 1 || result.SessionsImported != 1 || result.ObservationsImported != 1 {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	if _, err := dst.GetObservationBySyncID("obs-rollback-source"); err != nil {
+		t.Fatalf("expected source observation to import: %v", err)
+	}
+	if _, err := dst.GetSession("sess-relation-rollback"); err != nil {
+		t.Fatalf("expected session to import: %v", err)
+	}
+	if _, err := dst.GetRelation("rel-missing-endpoint"); err == nil {
+		t.Fatal("expected unresolved relation to remain unapplied")
+	}
+	deferred, dead, err := dst.CountDeferredAndDead()
+	if err != nil {
+		t.Fatalf("count deferred relation: %v", err)
+	}
+	if deferred != 1 || dead != 0 {
+		t.Fatalf("expected one deferred relation and no dead relations, got deferred=%d dead=%d", deferred, dead)
+	}
+	synced, err := dst.GetSyncedChunksForTarget(cloudTargetKey("proj-a"))
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if !synced[chunkID] {
+		t.Fatalf("expected chunk %q with a deferred relation to be marked synced", chunkID)
+	}
+}
+
+func TestCloudImportEmptyProjectDoesNotReplayAnotherProjectDeferredRelation(t *testing.T) {
+	dst := newTestStore(t)
+	for _, project := range []string{"project-a", "project-b"} {
+		if err := dst.EnrollProject(project); err != nil {
+			t.Fatalf("enroll %s: %v", project, err)
+		}
+	}
+
+	if err := dst.ApplyPulledMutation(cloudTargetKey("project-a"), store.SyncMutation{
+		Seq:       1,
+		Entity:    store.SyncEntityRelation,
+		EntityKey: "rel-project-a-deferred",
+		Op:        store.SyncOpUpsert,
+		Payload:   `{"sync_id":"rel-project-a-deferred","source_id":"obs-project-a-source","target_id":"obs-project-a-missing","relation":"related","judgment_status":"judged","marked_by_actor":"test-actor","marked_by_kind":"test","project":"project-a"}`,
+	}); err != nil {
+		t.Fatalf("seed project-a deferred relation: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: 1}
+	result, err := NewCloudWithTransport(dst, transport, "project-b").Import()
+	if err != nil {
+		t.Fatalf("empty project-b import: %v", err)
+	}
+	if result.RelationsReplayed != 0 || result.RelationsDeferred != 0 || result.RelationsDead != 0 {
+		t.Fatalf("unexpected project-b import result: %+v", result)
+	}
+
+	rows, err := dst.ListDeferred(store.ListDeferredOptions{Status: "deferred"})
+	if err != nil {
+		t.Fatalf("list deferred rows: %v", err)
+	}
+	if len(rows) != 1 || rows[0].TargetKey != cloudTargetKey("project-a") || rows[0].Project != "project-a" || rows[0].RetryCount != 0 {
+		t.Fatalf("project-a deferred row changed by empty project-b import: %+v", rows)
+	}
+	deferred, dead, err := dst.CountDeferredAndDeadForScope(cloudTargetKey("project-b"), "project-b")
+	if err != nil || deferred != 0 || dead != 0 {
+		t.Fatalf("project-b scoped counts = deferred=%d dead=%d err=%v", deferred, dead, err)
+	}
+}
+
+func TestCloudImportMixedChunkAppliesDirectArrayDependenciesBeforeMutations(t *testing.T) {
+	dst := newTestStore(t)
+	if err := dst.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll destination project: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	chunkID := "chunk-mixed-direct-and-mutations"
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: chunkID, CreatedAt: "2026-04-10T10:00:00Z"}}}
+
+	mixedChunk := ChunkData{
+		Sessions: []store.Session{{
+			ID:        "sess-direct",
+			Project:   "proj-a",
+			Directory: "/tmp/proj-a",
+			StartedAt: "2026-04-10 09:59:00",
+		}},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-direct-dep",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-direct-dep","session_id":"sess-direct","type":"note","title":"mixed","content":"depends on direct session","project":"proj-a","scope":"project"}`,
+		}},
+	}
+	chunkPayload, err := json.Marshal(mixedChunk)
+	if err != nil {
+		t.Fatalf("marshal mixed chunk: %v", err)
+	}
+	transport.chunks[chunkID] = chunkPayload
+
+	importer := NewCloudWithTransport(dst, transport, "proj-a")
+	if _, err := importer.Import(); err != nil {
+		t.Fatalf("cloud import should apply direct-array dependencies before mutation replay: %v", err)
+	}
+
+	if _, err := dst.GetSession("sess-direct"); err != nil {
+		t.Fatalf("expected direct-array session to be imported: %v", err)
+	}
+	results, err := dst.Search("depends on direct session", store.SearchOptions{Project: "proj-a", Limit: 5})
+	if err != nil {
+		t.Fatalf("search imported observation: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatalf("expected observation mutation that depends on direct-array session to import successfully")
+	}
+}
+
+func TestBuildImportMutationsSkipsClosureOnlyDirectSessionsWhenChunkHasExplicitMutations(t *testing.T) {
+	chunk := ChunkData{
+		Sessions: []store.Session{
+			{ID: "sess-needed", Project: "proj-a", Directory: "/tmp/proj-a"},
+			{ID: "sess-closure-only", Project: "proj-b", Directory: "/tmp/proj-b"},
+		},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-needs-session",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-needs-session","session_id":"sess-needed","type":"note","title":"needed","content":"depends on direct session","project":"proj-a","scope":"project"}`,
+		}},
+	}
+
+	mutations := buildImportMutations(chunk)
+
+	seenNeededSession := false
+	seenClosureOnlySession := false
+	for _, mutation := range mutations {
+		if mutation.Entity != store.SyncEntitySession || mutation.Op != store.SyncOpUpsert {
+			continue
+		}
+		switch mutation.EntityKey {
+		case "sess-needed":
+			seenNeededSession = true
+		case "sess-closure-only":
+			seenClosureOnlySession = true
+		}
+	}
+
+	if !seenNeededSession {
+		t.Fatalf("expected direct session required by explicit mutation to be synthesized")
+	}
+	if seenClosureOnlySession {
+		t.Fatalf("closure-only direct session must not be synthesized when explicit mutations exist")
+	}
+}
+
+func TestBuildImportMutationsPreservesSessionsNeededByRetainedSynthesizedEntities(t *testing.T) {
+	project := "proj-a"
+	chunk := ChunkData{
+		Sessions: []store.Session{{ID: "sess-direct", Project: project, Directory: "/tmp/proj-a"}},
+		Observations: []store.Observation{{
+			SyncID:    "obs-direct",
+			SessionID: "sess-direct",
+			Type:      "note",
+			Title:     "direct",
+			Content:   "direct-array observation",
+			Project:   &project,
+			Scope:     "project",
+		}},
+		Mutations: []store.SyncMutation{{
+			Entity:    store.SyncEntityObservation,
+			EntityKey: "obs-explicit",
+			Op:        store.SyncOpUpsert,
+			Payload:   `{"sync_id":"obs-explicit","session_id":"sess-explicit","type":"note","title":"explicit","content":"keeps explicit path","project":"proj-a","scope":"project"}`,
+		}},
+	}
+
+	mutations := buildImportMutations(chunk)
+
+	seenDirectSession := false
+	seenDirectObservation := false
+	for _, mutation := range mutations {
+		switch {
+		case mutation.Entity == store.SyncEntitySession && mutation.Op == store.SyncOpUpsert && mutation.EntityKey == "sess-direct":
+			seenDirectSession = true
+		case mutation.Entity == store.SyncEntityObservation && mutation.Op == store.SyncOpUpsert && mutation.EntityKey == "obs-direct":
+			seenDirectObservation = true
+		}
+	}
+
+	if !seenDirectObservation {
+		t.Fatalf("expected retained synthesized observation from direct arrays")
+	}
+	if !seenDirectSession {
+		t.Fatalf("expected synthesized session required by retained synthesized observation")
+	}
+}
+
+func TestEstimateMutationImportResultDeduplicatesEffectiveMutations(t *testing.T) {
+	chunk := ChunkData{Mutations: []store.SyncMutation{
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityObservation, EntityKey: "obs-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpDelete},
+		{Entity: store.SyncEntitySession, EntityKey: "sess-a", Op: store.SyncOpUpsert},
+		{Entity: store.SyncEntitySession, EntityKey: "sess-a", Op: store.SyncOpUpsert},
+	}}
+
+	res := estimateMutationImportResult(chunk)
+	if res.SessionsImported != 1 {
+		t.Fatalf("expected deduped session count=1, got %d", res.SessionsImported)
+	}
+	if res.ObservationsImported != 1 {
+		t.Fatalf("expected deduped observation count=1, got %d", res.ObservationsImported)
+	}
+	if res.PromptsImported != 0 {
+		t.Fatalf("expected prompt final delete to count as 0 imports, got %d", res.PromptsImported)
+	}
+}
+
+func TestFilterByPendingMutationsPaginatesBeforeProjectFiltering(t *testing.T) {
+	resetSyncTestHooks(t)
+
+	s := newTestStore(t)
+	sy := NewCloudWithTransport(s, newFakeCloudTransport(), "proj-a")
+
+	projA := "proj-a"
+	data := &store.ExportData{
+		Sessions: []store.Session{{ID: "sess-a", Project: "proj-a"}},
+		Observations: []store.Observation{{
+			ID:        1,
+			SyncID:    "obs-a",
+			SessionID: "sess-a",
+			Project:   &projA,
+		}},
+	}
+
+	storeListMutationsAfterSeq = func(_ *store.Store, _ string, afterSeq int64, _ int) ([]store.SyncMutation, error) {
+		switch afterSeq {
+		case 0:
+			batch := make([]store.SyncMutation, 0, 5000)
+			for seq := int64(1); seq <= 5000; seq++ {
+				batch = append(batch, store.SyncMutation{
+					Seq:       seq,
+					Entity:    store.SyncEntityObservation,
+					EntityKey: fmt.Sprintf("obs-other-%d", seq),
+					Op:        store.SyncOpUpsert,
+					Project:   "proj-b",
+				})
+			}
+			return batch, nil
+		case 5000:
+			return []store.SyncMutation{{
+				Seq:       5001,
+				Entity:    store.SyncEntityObservation,
+				EntityKey: "obs-a",
+				Op:        store.SyncOpUpsert,
+				Project:   "proj-a",
+			}}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	chunk, seqs, err := sy.filterByPendingMutations(data, "proj-a")
+	if err != nil {
+		t.Fatalf("filter by pending mutations: %v", err)
+	}
+	if len(seqs) != 1 || seqs[0] != 5001 {
+		t.Fatalf("expected project mutation from second page to be selected, got seqs=%v", seqs)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-a" {
+		t.Fatalf("expected paginated project observation to be included, got %+v", chunk.Observations)
+	}
+}
+
+func TestExportDoesNotReconcileUnsyncedChunksByCreatedByOnly(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{
+		Version: 1,
+		Chunks: []ChunkEntry{{
+			ID:        "foreign-like",
+			CreatedBy: "alice",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+
+	sy := NewWithTransport(s, transport)
+	res, err := sy.Export("alice", "")
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if !res.IsEmpty {
+		t.Fatalf("expected empty export result, got %+v", res)
+	}
+
+	synced, err := s.GetSyncedChunks()
+	if err != nil {
+		t.Fatalf("get synced chunks: %v", err)
+	}
+	if synced["foreign-like"] {
+		t.Fatal("chunk ownership must not be inferred from CreatedBy alone")
+	}
+}
+
+func TestCloudImportTreatsMissingManifestChunkAsError(t *testing.T) {
+	s := newTestStore(t)
+	transport := newFakeCloudTransport()
+	transport.manifest = &Manifest{Version: 1, Chunks: []ChunkEntry{{ID: "missing", CreatedAt: time.Now().UTC().Format(time.RFC3339)}}}
+	sy := NewCloudWithTransport(s, transport, "proj-a")
+
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Missing chunk referenced by manifest must fail loudly in cloud mode.
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "manifest references missing remote chunk") {
+		t.Fatalf("expected manifest missing chunk failure, got %v", err)
+	}
+
+	// now force a non-not-found read failure and ensure it propagates loudly
+	transport.readChunkErr = errors.New("transport offline")
+	if _, err := sy.Import(); err == nil || !strings.Contains(err.Error(), "read chunk") {
+		t.Fatalf("expected read chunk failure to propagate, got %v", err)
+	}
+}
+
+func TestFilterFunctionsAndTimeNormalization(t *testing.T) {
+	data := &store.ExportData{
+		Version:    "0.1.0",
+		ExportedAt: "2025-01-01 00:00:00",
+		Sessions: []store.Session{
+			{ID: "s1", Project: "proj-a", StartedAt: "2025-01-01 10:00:00"},
+			{ID: "s2", Project: "proj-b", StartedAt: "2025-01-01 11:00:00"},
+		},
+		Observations: []store.Observation{
+			{ID: 1, SessionID: "s1", CreatedAt: "2025-01-01 10:00:00"},
+			{ID: 2, SessionID: "s2", CreatedAt: "2025-01-01 11:00:00"},
+		},
+		Prompts: []store.Prompt{
+			{ID: 1, SessionID: "s1", CreatedAt: "2025-01-01 10:00:00"},
+			{ID: 2, SessionID: "s2", CreatedAt: "2025-01-01 11:00:00"},
+		},
+	}
+
+	projectOnly := filterByProject(data, "proj-a")
+	if len(projectOnly.Sessions) != 1 || projectOnly.Sessions[0].ID != "s1" {
+		t.Fatalf("unexpected filtered sessions: %+v", projectOnly.Sessions)
+	}
+	if len(projectOnly.Observations) != 1 || projectOnly.Observations[0].SessionID != "s1" {
+		t.Fatalf("unexpected filtered observations: %+v", projectOnly.Observations)
+	}
+	if len(projectOnly.Prompts) != 1 || projectOnly.Prompts[0].SessionID != "s1" {
+		t.Fatalf("unexpected filtered prompts: %+v", projectOnly.Prompts)
+	}
+
+	projectOnlyNormalized := filterByProject(data, " PROJ-A ")
+	if len(projectOnlyNormalized.Sessions) != 1 || projectOnlyNormalized.Sessions[0].ID != "s1" {
+		t.Fatalf("expected normalized project filter to match session s1, got %+v", projectOnlyNormalized.Sessions)
+	}
+
+	sy := New(nil, t.TempDir())
+	all := sy.filterNewData(data, "")
+	if len(all.Sessions) != 2 || len(all.Observations) != 2 || len(all.Prompts) != 2 {
+		t.Fatalf("expected first sync to include all data, got %+v", all)
+	}
+
+	newOnly := sy.filterNewData(data, "2025-01-01T10:30:00Z")
+	if len(newOnly.Sessions) != 1 || newOnly.Sessions[0].ID != "s2" {
+		t.Fatalf("unexpected new sessions: %+v", newOnly.Sessions)
+	}
+	if len(newOnly.Observations) != 1 || newOnly.Observations[0].ID != 2 {
+		t.Fatalf("unexpected new observations: %+v", newOnly.Observations)
+	}
+	if len(newOnly.Prompts) != 1 || newOnly.Prompts[0].ID != 2 {
+		t.Fatalf("unexpected new prompts: %+v", newOnly.Prompts)
+	}
+
+	if got := normalizeTime("2025-01-01T15:04:05Z"); got != "2025-01-01 15:04:05" {
+		t.Fatalf("unexpected RFC3339 normalization: %q", got)
+	}
+	if got := normalizeTime(" 2025-01-01 15:04:05 "); got != "2025-01-01 15:04:05" {
+		t.Fatalf("unexpected plain normalization: %q", got)
+	}
+
+	m := &Manifest{Chunks: []ChunkEntry{{ID: "old", CreatedAt: "2025-01-01T00:00:00Z"}, {ID: "new", CreatedAt: "2025-02-01T00:00:00Z"}}}
+	if got := sy.lastChunkTime(m); got != "2025-02-01T00:00:00Z" {
+		t.Fatalf("unexpected last chunk time: %q", got)
+	}
+}
+
+// TestFilterNewDataIncludesEditedObservations verifies that an observation whose
+// CreatedAt is before the sync cutoff but whose UpdatedAt is after the cutoff is
+// included in the filtered export (issue #447).
+func TestFilterNewDataIncludesEditedObservations(t *testing.T) {
+	data := &store.ExportData{
+		Version:    "0.1.0",
+		ExportedAt: "2025-01-01 00:00:00",
+		Observations: []store.Observation{
+			// created before cutoff, never edited -> should be EXCLUDED
+			{ID: 1, SessionID: "s1", CreatedAt: "2025-01-01 09:00:00", UpdatedAt: "2025-01-01 09:00:00"},
+			// created before cutoff, edited AFTER cutoff -> should be INCLUDED
+			{ID: 2, SessionID: "s1", CreatedAt: "2025-01-01 09:00:00", UpdatedAt: "2025-01-01 11:00:00"},
+			// created after cutoff -> should be INCLUDED (existing behaviour)
+			{ID: 3, SessionID: "s1", CreatedAt: "2025-01-01 11:00:00", UpdatedAt: "2025-01-01 11:00:00"},
+		},
+	}
+
+	cutoff := "2025-01-01T10:30:00Z"
+	sy := New(nil, t.TempDir())
+	filtered := sy.filterNewData(data, cutoff)
+
+	ids := make([]int64, 0, len(filtered.Observations))
+	for _, o := range filtered.Observations {
+		ids = append(ids, o.ID)
+	}
+
+	// ID 1 must be absent; IDs 2 and 3 must be present.
+	for _, id := range ids {
+		if id == 1 {
+			t.Fatalf("filterNewData included observation ID 1 (stale, unedited) — should have been excluded; ids=%v", ids)
+		}
+	}
+	found2, found3 := false, false
+	for _, id := range ids {
+		if id == 2 {
+			found2 = true
+		}
+		if id == 3 {
+			found3 = true
+		}
+	}
+	if !found2 {
+		t.Fatalf("filterNewData excluded observation ID 2 (edited after cutoff) — should have been included; ids=%v", ids)
+	}
+	if !found3 {
+		t.Fatalf("filterNewData excluded observation ID 3 (created after cutoff) — should have been included; ids=%v", ids)
+	}
+}
+
+func TestFilterByProjectEntityLevel(t *testing.T) {
+	projA := "proj-a"
+
+	data := &store.ExportData{
+		Version:    "0.1.0",
+		ExportedAt: "2025-01-01 00:00:00",
+		Sessions: []store.Session{
+			{ID: "s-match", Project: "proj-a", StartedAt: "2025-01-01 10:00:00"},
+			{ID: "s-empty", Project: "", StartedAt: "2025-01-01 11:00:00"},
+			{ID: "s-other", Project: "proj-b", StartedAt: "2025-01-01 12:00:00"},
+			{ID: "s-orphan", Project: "proj-c", StartedAt: "2025-01-01 13:00:00"},
+		},
+		Observations: []store.Observation{
+			// obs in matching session — included via session
+			{ID: 1, SessionID: "s-match", CreatedAt: "2025-01-01 10:00:00"},
+			// obs with own project but session has empty project — included via entity project
+			{ID: 2, SessionID: "s-empty", Project: &projA, CreatedAt: "2025-01-01 11:00:00"},
+			// obs with own project but session has different project — included via entity project
+			{ID: 3, SessionID: "s-other", Project: &projA, CreatedAt: "2025-01-01 12:00:00"},
+			// obs with nil project in non-matching session — excluded
+			{ID: 4, SessionID: "s-other", Project: nil, CreatedAt: "2025-01-01 12:30:00"},
+		},
+		Prompts: []store.Prompt{
+			// prompt in matching session — included via session
+			{ID: 1, SessionID: "s-match", CreatedAt: "2025-01-01 10:00:00"},
+			// prompt with own project but session has empty project — included via entity project
+			{ID: 2, SessionID: "s-empty", Project: "proj-a", CreatedAt: "2025-01-01 11:00:00"},
+			// prompt with wrong project in non-matching session — excluded
+			{ID: 3, SessionID: "s-other", Project: "proj-b", CreatedAt: "2025-01-01 12:00:00"},
+		},
+	}
+
+	result := filterByProject(data, "proj-a")
+
+	// Observations: IDs 1, 2, 3 should be included
+	if len(result.Observations) != 3 {
+		t.Fatalf("expected 3 observations, got %d: %+v", len(result.Observations), result.Observations)
+	}
+	obsIDs := map[int64]bool{}
+	for _, o := range result.Observations {
+		obsIDs[o.ID] = true
+	}
+	for _, id := range []int64{1, 2, 3} {
+		if !obsIDs[id] {
+			t.Errorf("expected observation %d to be included", id)
+		}
+	}
+	if obsIDs[4] {
+		t.Error("observation 4 (nil project, non-matching session) should be excluded")
+	}
+
+	// Prompts: IDs 1, 2 should be included
+	if len(result.Prompts) != 2 {
+		t.Fatalf("expected 2 prompts, got %d: %+v", len(result.Prompts), result.Prompts)
+	}
+	promptIDs := map[int64]bool{}
+	for _, p := range result.Prompts {
+		promptIDs[p.ID] = true
+	}
+	if !promptIDs[1] || !promptIDs[2] {
+		t.Error("expected prompts 1 and 2 to be included")
+	}
+	if promptIDs[3] {
+		t.Error("prompt 3 (wrong project, non-matching session) should be excluded")
+	}
+
+	// Sessions: s-match (direct), s-empty (referenced by obs 2), s-other (referenced by obs 3)
+	// s-orphan should be excluded (not referenced by any included entity)
+	if len(result.Sessions) != 3 {
+		t.Fatalf("expected 3 sessions, got %d: %+v", len(result.Sessions), result.Sessions)
+	}
+	sessIDs := map[string]bool{}
+	for _, s := range result.Sessions {
+		sessIDs[s.ID] = true
+	}
+	if !sessIDs["s-match"] || !sessIDs["s-empty"] || !sessIDs["s-other"] {
+		t.Error("expected sessions s-match, s-empty, s-other to be included")
+	}
+	if sessIDs["s-orphan"] {
+		t.Error("session s-orphan should be excluded (no referenced entities)")
+	}
+}
+
+func TestGzipHelpers(t *testing.T) {
+	t.Run("roundtrip", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "chunk.jsonl.gz")
+		payload := []byte(`{"sessions":1,"observations":2}`)
+
+		if err := writeGzip(path, payload); err != nil {
+			t.Fatalf("write gzip: %v", err)
+		}
+
+		got, err := readGzip(path)
+		if err != nil {
+			t.Fatalf("read gzip: %v", err)
+		}
+		if string(got) != string(payload) {
+			t.Fatalf("gzip mismatch: got %q want %q", got, payload)
+		}
+	})
+
+	t.Run("write error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing", "chunk.gz")
+		if err := writeGzip(path, []byte("x")); err == nil {
+			t.Fatal("expected writeGzip error for missing parent dir")
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "not-gzip")
+		if err := os.WriteFile(path, []byte("plain text"), 0o644); err != nil {
+			t.Fatalf("write plain file: %v", err)
+		}
+
+		if _, err := readGzip(path); err == nil {
+			t.Fatal("expected readGzip error for non-gzip file")
+		}
+	})
+
+	t.Run("truncated gzip propagates decompression error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "truncated.gz")
+		if err := os.WriteFile(path, []byte{0x1f, 0x8b, 0x08, 0x00}, 0o644); err != nil {
+			t.Fatalf("write truncated gzip: %v", err)
+		}
+
+		if _, err := readGzip(path); err == nil {
+			t.Fatal("expected readGzip error for truncated gzip payload")
+		}
+	})
+
+	t.Run("gzip write and close errors", func(t *testing.T) {
+		resetSyncTestHooks(t)
+		path := filepath.Join(t.TempDir(), "chunk.gz")
+
+		gzipWriterFactory = func(_ *os.File) gzipWriter {
+			return &fakeGzipWriter{writeErr: errors.New("forced write error")}
+		}
+		if err := writeGzip(path, []byte("x")); err == nil {
+			t.Fatal("expected forced gzip write error")
+		}
+
+		gzipWriterFactory = func(_ *os.File) gzipWriter {
+			return &fakeGzipWriter{closeErr: errors.New("forced close error")}
+		}
+		if err := writeGzip(path, []byte("x")); err == nil {
+			t.Fatal("expected forced gzip close error")
+		}
+	})
+}
+
+func TestGetUsernameAndManifestSummary(t *testing.T) {
+	t.Run("username precedence", func(t *testing.T) {
+		t.Setenv("USER", "")
+		t.Setenv("USERNAME", "windows-user")
+		if got := GetUsername(); got != "windows-user" {
+			t.Fatalf("expected USERNAME fallback, got %q", got)
+		}
+
+		t.Setenv("USER", "unix-user")
+		t.Setenv("USERNAME", "windows-user")
+		if got := GetUsername(); got != "unix-user" {
+			t.Fatalf("expected USER to win, got %q", got)
+		}
+
+		t.Setenv("USER", "")
+		t.Setenv("USERNAME", "")
+		if got := GetUsername(); got == "" {
+			t.Fatal("expected hostname or unknown fallback")
+		}
+
+		resetSyncTestHooks(t)
+		osHostname = func() (string, error) {
+			return "", errors.New("forced no hostname")
+		}
+		if got := GetUsername(); got != "unknown" {
+			t.Fatalf("expected unknown fallback, got %q", got)
+		}
+	})
+
+	t.Run("manifest summary", func(t *testing.T) {
+		empty := ManifestSummary(&Manifest{Version: 1})
+		if empty != "No chunks synced yet." {
+			t.Fatalf("unexpected empty summary: %q", empty)
+		}
+
+		summary := ManifestSummary(&Manifest{Chunks: []ChunkEntry{
+			{ID: "1", CreatedBy: "bob", Sessions: 1, Memories: 2},
+			{ID: "2", CreatedBy: "alice", Sessions: 2, Memories: 3},
+			{ID: "3", CreatedBy: "alice", Sessions: 1, Memories: 1},
+		}})
+
+		if !strings.Contains(summary, "3 chunks") || !strings.Contains(summary, "6 memories") || !strings.Contains(summary, "4 sessions") {
+			t.Fatalf("summary totals missing: %q", summary)
+		}
+		if !strings.Contains(summary, "alice (2 chunks), bob (1 chunks)") {
+			t.Fatalf("summary contributors not sorted or counted: %q", summary)
+		}
+	})
+}
+
+func TestChunkTrackingTargetKeyScopesBySyncTarget(t *testing.T) {
+	local := &Syncer{cloudMode: false}
+	if got := local.chunkTrackingTargetKey(""); got != store.LocalChunkTargetKey {
+		t.Fatalf("expected local chunk target key %q, got %q", store.LocalChunkTargetKey, got)
+	}
+
+	cloud := &Syncer{cloudMode: true, project: "proj-a"}
+	if got := cloud.chunkTrackingTargetKey(""); got != "cloud:proj-a" {
+		t.Fatalf("expected cloud project target key, got %q", got)
+	}
+	if got := cloud.chunkTrackingTargetKey("PROJ-B"); got != "cloud:proj-b" {
+		t.Fatalf("expected explicit normalized cloud project target key, got %q", got)
+	}
+}
+
+// TestCloudSyncPreservesPiPromptIdentityUnderProjectScope proves the second half of #706: a prompt
+// saved through the Pi plugin's wire shape does not stop at the local database. It must enqueue a
+// sync mutation under its own project scope and survive the cloud push/pull round trip with the
+// identity the dashboard addresses it by — its sync_id — intact.
+//
+// The dashboard resolves a prompt by sync_id (see TestPromptDetailURLUsesSyncID), so a prompt that
+// arrives without its sync_id, or under the wrong project, is a prompt the dashboard reports as
+// absent even though the local save succeeded.
+func TestCloudSyncPreservesPiPromptIdentityUnderProjectScope(t *testing.T) {
+	const (
+		targetProject = "paidosdep"
+		otherProject  = "skill-registry"
+		promptContent = "preserve this exact user prompt about auth token rotation"
+	)
+
+	// The Pi plugin derives a stable per-project session id when the caller names a project.
+	targetSession := "manual-save-" + targetProject
+	otherSession := "manual-save-" + otherProject
+
+	srcStore := newTestStore(t)
+	if err := srcStore.EnrollProject(targetProject); err != nil {
+		t.Fatalf("enroll target project: %v", err)
+	}
+	if err := srcStore.CreateSession(targetSession, targetProject, "/tmp/"+targetProject); err != nil {
+		t.Fatalf("create target session: %v", err)
+	}
+	if err := srcStore.CreateSession(otherSession, otherProject, "/tmp/"+otherProject); err != nil {
+		t.Fatalf("create other session: %v", err)
+	}
+
+	if _, err := srcStore.AddPrompt(store.AddPromptParams{
+		SessionID: targetSession,
+		Content:   promptContent,
+		Project:   targetProject,
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+	// A prompt in a neighbouring project keeps the scope assertions honest.
+	if _, err := srcStore.AddPrompt(store.AddPromptParams{
+		SessionID: otherSession,
+		Content:   "an unrelated prompt that must stay in its own project",
+		Project:   otherProject,
+	}); err != nil {
+		t.Fatalf("add other prompt: %v", err)
+	}
+
+	srcPrompts, err := srcStore.RecentPrompts(targetProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(srcPrompts) != 1 {
+		t.Fatalf("expected exactly one prompt in %q, got %d", targetProject, len(srcPrompts))
+	}
+	saved := srcPrompts[0]
+	if strings.TrimSpace(saved.SyncID) == "" {
+		t.Fatal("expected the saved prompt to carry a sync_id")
+	}
+
+	// The mutation the prompt enqueues must be filed under the prompt's own project, keyed by the
+	// sync_id, and carry the project inside the payload the cloud will materialize from.
+	pending, err := srcStore.ListPendingProjectMutations(targetProject)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	var promptMutation *store.SyncMutation
+	for i := range pending {
+		if pending[i].Entity == store.SyncEntityPrompt && pending[i].EntityKey == saved.SyncID {
+			promptMutation = &pending[i]
+			break
+		}
+	}
+	if promptMutation == nil {
+		t.Fatalf("no pending prompt mutation for sync_id %q under project %q", saved.SyncID, targetProject)
+	}
+	if promptMutation.Op != store.SyncOpUpsert {
+		t.Fatalf("expected upsert op, got %q", promptMutation.Op)
+	}
+	if promptMutation.Project != targetProject {
+		t.Fatalf("expected mutation project %q, got %q", targetProject, promptMutation.Project)
+	}
+	var payload struct {
+		SyncID    string  `json:"sync_id"`
+		SessionID string  `json:"session_id"`
+		Content   string  `json:"content"`
+		Project   *string `json:"project"`
+	}
+	if err := json.Unmarshal([]byte(promptMutation.Payload), &payload); err != nil {
+		t.Fatalf("decode prompt mutation payload: %v", err)
+	}
+	if payload.SyncID != saved.SyncID || payload.Content != promptContent || payload.SessionID != targetSession {
+		t.Fatalf("prompt mutation payload does not describe the saved prompt: %+v", payload)
+	}
+	if payload.Project == nil || *payload.Project != targetProject {
+		t.Fatalf("expected payload project %q, got %v", targetProject, payload.Project)
+	}
+
+	// The neighbouring project must not have picked up this prompt's mutation.
+	otherPending, err := srcStore.ListPendingProjectMutations(otherProject)
+	if err != nil {
+		t.Fatalf("list other pending mutations: %v", err)
+	}
+	for _, m := range otherPending {
+		if m.EntityKey == saved.SyncID {
+			t.Fatalf("prompt mutation %q leaked into project %q", saved.SyncID, otherProject)
+		}
+	}
+
+	// Push the target project to the cloud and pull it into a clean store.
+	transport := newFakeCloudTransport()
+	exportResult, err := NewCloudWithTransport(srcStore, transport, targetProject).Export("alice", targetProject)
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if exportResult.IsEmpty {
+		t.Fatal("expected a non-empty cloud export carrying the prompt")
+	}
+
+	dstStore := newTestStore(t)
+	if err := dstStore.EnrollProject(targetProject); err != nil {
+		t.Fatalf("enroll dst project: %v", err)
+	}
+	importResult, err := NewCloudWithTransport(dstStore, transport, targetProject).Import()
+	if err != nil {
+		t.Fatalf("cloud import: %v", err)
+	}
+	if importResult.ChunksImported == 0 {
+		t.Fatalf("expected at least one imported chunk, got %+v", importResult)
+	}
+
+	// The pulled prompt keeps the identity the dashboard addresses it by.
+	pulled, err := dstStore.RecentPrompts(targetProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts after pull: %v", err)
+	}
+	var arrived *store.Prompt
+	for i := range pulled {
+		if pulled[i].SyncID == saved.SyncID {
+			arrived = &pulled[i]
+			break
+		}
+	}
+	if arrived == nil {
+		t.Fatalf("prompt %q did not survive the cloud round trip into project %q (got %d prompts)", saved.SyncID, targetProject, len(pulled))
+	}
+	if arrived.Content != promptContent {
+		t.Fatalf("pulled prompt content changed: %q", arrived.Content)
+	}
+	if arrived.Project != targetProject {
+		t.Fatalf("expected pulled prompt project %q, got %q", targetProject, arrived.Project)
+	}
+	if arrived.SessionID != targetSession {
+		t.Fatalf("expected pulled prompt session %q, got %q", targetSession, arrived.SessionID)
+	}
+
+	// The round trip must not have widened the prompt's scope.
+	strayed, err := dstStore.RecentPrompts(otherProject, 10)
+	if err != nil {
+		t.Fatalf("recent prompts for other project after pull: %v", err)
+	}
+	for _, p := range strayed {
+		if p.SyncID == saved.SyncID {
+			t.Fatalf("prompt %q strayed into project %q after the round trip", saved.SyncID, otherProject)
+		}
+	}
+}
