@@ -80,207 +80,16 @@ que se pinta según la disponibilidad.
 
 ## 3. DER
 
-```mermaid
-erDiagram
-    EMPRESAS  ||--o{ USUARIOS : "emplea (rol empresa)"
-    EMPRESAS  |o--o{ LUGARES : "carga (NULL = plataforma)"
-    EMPRESAS  ||--o{ ARTISTAS : carga
-    EMPRESAS  ||--o{ EVENTOS : organiza
+El modelo de datos completo está en **[docs/der/DER.md](der/DER.md)** (entidades, cardinalidades, restricciones, reglas de borrado, normalización)
+y en **[docs/der/backstage.dbml](der/backstage.dbml)** (para ver y exportar el diagrama en dbdiagram.io).
 
-    LUGARES   ||--o{ ESCENARIOS : tiene
-    LUGARES   ||--o{ ESPACIOS : "se divide en"
-    LUGARES   ||--o{ ELEMENTOS_PLANO : "muestra en el plano"
-    LUGARES   ||--o{ EVENTOS : aloja
+Resumen: 14 tablas en 4 grupos.
+- **Plataforma:** empresas, usuarios
+- **Lugares y plano:** lugares, escenarios, espacios, elementos_plano
+- **Programación:** artistas, eventos, jornadas, evento_escenarios, presentaciones
+- **Ventas:** tarifas, compras, entradas
 
-    EVENTOS   ||--|{ JORNADAS : "se hace en"
-    EVENTOS   ||--o{ EVENTO_ESCENARIOS : usa
-    ESCENARIOS ||--o{ EVENTO_ESCENARIOS : "es usado en"
-
-    JORNADAS  ||--o{ PRESENTACIONES : contiene
-    EVENTO_ESCENARIOS ||--o{ PRESENTACIONES : "aloja"
-    ARTISTAS  ||--o{ PRESENTACIONES : "toca en"
-
-    EVENTOS   ||--o{ TARIFAS : vende
-    ESPACIOS  ||--o{ TARIFAS : "tiene precio en"
-    JORNADAS  |o--o{ TARIFAS : "vale para (NULL = abono)"
-
-    USUARIOS  ||--o{ COMPRAS : "realiza (rol cliente)"
-    EVENTOS   ||--o{ COMPRAS : "se compra en"
-    COMPRAS   ||--|{ ENTRADAS : genera
-    TARIFAS   ||--o{ ENTRADAS : "se emite con"
-
-    EMPRESAS {
-        int id_empresa PK
-        varchar nombre
-        varchar cuit UK
-        varchar email
-        varchar telefono
-        varchar direccion
-        varchar logo_url
-        numeric cargo_servicio_pct "service charge, default 10"
-        bool activo
-        timestamp fecha_creacion
-    }
-    USUARIOS {
-        int id_usuario PK
-        varchar email UK
-        varchar password_hash
-        varchar nombre
-        varchar rol "superadmin | empresa | cliente"
-        int id_empresa FK "obligatorio solo si rol = empresa"
-        varchar dni
-        bool activo
-        timestamp fecha_creacion
-    }
-    LUGARES {
-        int id_lugar PK
-        int id_empresa FK "NULL = plataforma"
-        varchar nombre
-        varchar tipo "estadio | arena | teatro | predio | club"
-        varchar direccion
-        varchar ciudad
-        varchar provincia
-        varchar imagen_url
-        int plano_ancho "tamaño del lienzo, NULL = sin plano"
-        int plano_alto
-        bool activo
-    }
-    ESCENARIOS {
-        int id_escenario PK
-        int id_lugar FK
-        varchar nombre
-        varchar descripcion
-        jsonb geometria "forma en el plano, opcional"
-    }
-    ESPACIOS {
-        int id_espacio PK
-        int id_lugar FK
-        varchar nombre "Platea, Campo, VIP..."
-        varchar modalidad "de pie | sentado"
-        int capacidad "esto define el cupo"
-        varchar color
-        jsonb geometria "forma en el plano, opcional"
-    }
-    ELEMENTOS_PLANO {
-        int id_elemento PK
-        int id_lugar FK
-        varchar tipo "cabina_dj | barra | banos | ingreso | mangrullo | otro"
-        varchar etiqueta
-        jsonb geometria
-    }
-    ARTISTAS {
-        int id_artista PK
-        int id_empresa FK "NOT NULL"
-        varchar nombre
-        varchar genero
-        varchar pais
-        text bio
-        varchar imagen_url
-        bool activo
-    }
-    EVENTOS {
-        int id_evento PK
-        int id_empresa FK
-        int id_lugar FK
-        varchar nombre
-        text descripcion
-        varchar tipo "recital | festival"
-        date fecha_inicio
-        date fecha_fin
-        varchar estado "borrador | publicado | agotado | cancelado | finalizado"
-        varchar imagen_url
-        timestamp fecha_creacion
-    }
-    JORNADAS {
-        int id_jornada PK
-        int id_evento FK
-        date fecha
-        time hora_apertura
-    }
-    EVENTO_ESCENARIOS {
-        int id_evento PK, FK
-        int id_escenario PK, FK
-        int id_lugar FK "copia para validar consistencia"
-    }
-    PRESENTACIONES {
-        int id_presentacion PK
-        int id_evento FK
-        int id_jornada FK
-        int id_escenario FK
-        int id_artista FK
-        timestamp inicio
-        timestamp fin
-        bool headliner
-    }
-    TARIFAS {
-        int id_tarifa PK
-        int id_evento FK
-        int id_espacio FK
-        int id_jornada FK "NULL = abono todas las jornadas"
-        int id_lugar FK "copia para validar consistencia"
-        varchar nombre "General, Preventa 1..."
-        numeric precio
-        timestamp venta_desde
-        timestamp venta_hasta
-        bool activa
-    }
-    COMPRAS {
-        int id_compra PK
-        int id_usuario FK
-        int id_evento FK
-        timestamp fecha
-        numeric subtotal "para la productora"
-        numeric cargo_servicio_pct "copia del % al momento de comprar"
-        numeric cargo_servicio "para la plataforma"
-        numeric total "subtotal + cargo_servicio"
-        varchar medio_pago "tarjeta | debito | transferencia (simulado)"
-        varchar referencia_pago "id de transacción ficticio"
-        varchar estado "pendiente | pagada | rechazada | cancelada"
-    }
-    ENTRADAS {
-        int id_entrada PK
-        int id_compra FK
-        int id_tarifa FK
-        uuid codigo UK
-        numeric precio_pagado
-        varchar estado "valida | usada | anulada"
-        timestamp fecha_uso
-    }
-```
-
-### 3.1 Cómo el modelo cubre los casos del dominio
-
-| Caso | Cómo se resuelve |
-| --- | --- |
-| Un lugar tiene 3, 4 u 8 escenarios | `escenarios` es 1:N con `lugares`, sin límite |
-| Un estadio tiene platea, campo, VIP… | `espacios` es 1:N con `lugares`, cada uno con su capacidad |
-| Un evento no usa todos los escenarios del lugar | `evento_escenarios` (N:M) lista los que **habilita** ese evento |
-| Un festival dura varios días | `jornadas` es 1:N con `eventos` (una fila por día) |
-| Un artista toca **varias fechas** en el mismo evento | Varias filas en `presentaciones` con distinta `id_jornada` |
-| Un artista toca **dos veces el mismo día en dos escenarios** | Dos filas en `presentaciones`, misma jornada, distinto `id_escenario` y horario |
-| Un artista **no** puede tocar en dos lugares al mismo tiempo | `EXCLUDE` por `id_artista` con rangos de horario superpuestos |
-| Un escenario **no** puede tener dos shows superpuestos | `EXCLUDE` por `id_escenario` con rangos de horario superpuestos |
-| La presentación es en un escenario que el evento habilitó | FK compuesta `(id_evento, id_escenario)` → `evento_escenarios` |
-| El escenario es del mismo lugar que el evento | FK compuesta `(id_evento, id_lugar)` → `eventos` y `(id_escenario, id_lugar)` → `escenarios` |
-| La tarifa se vende en un espacio del lugar del evento | Mismas FK compuestas en `tarifas` con `espacios` |
-| Entrada para un día o abono del festival completo | `tarifas.id_jornada` con valor = un día; `NULL` = abono |
-| La jornada cae dentro de las fechas del evento | Trigger en `jornadas` |
-| Una productora usa solo lugares de la plataforma o propios, y artistas propios | Trigger en `eventos` y `presentaciones`, y validación en el backend |
-| La plataforma cobra un service charge | `compras` guarda subtotal, % aplicado, cargo y total. Si después cambia el %, las compras viejas no se alteran |
-| El cupo de un sector es su capacidad | `espacios.capacidad`, que carga quien registró el lugar; la productora solo pone precios |
-| Varias tarifas (Preventa, General) en el mismo sector | Comparten el cupo del espacio: la disponibilidad se calcula por espacio y jornada, no por tarifa |
-| No se vende más que la capacidad | Al comprar, en una transacción: `SELECT … FOR UPDATE` sobre las tarifas de ese evento y espacio, y recálculo de la disponibilidad |
-| Capacidad total del lugar | No se guarda: `SUM(espacios.capacidad)` en la vista `v_lugares` (así nunca queda desactualizada) |
-| Sectorizar dibujando (platea, VIP, cabina de DJ…) | `geometria JSONB` en `espacios` y `escenarios`, y la tabla `elementos_plano` para lo que no se vende |
-
-### 3.2 Reglas de borrado
-
-- `eventos` → `jornadas`, `evento_escenarios`, `presentaciones`, `tarifas`: **ON DELETE CASCADE**. Un evento borrador se borra completo.
-- Un evento con compras **no se borra** (`compras` → `eventos` es RESTRICT): se pasa a estado `cancelado`.
-- `lugares`, `artistas`, `empresas` y `usuarios` se dan de **baja lógica** (`activo = false`). Si se usan en eventos, el borrado físico se bloquea por RESTRICT.
-- Si se cambia el lugar de un evento que ya tiene escenarios o tarifas asignados, la FK compuesta tira error. Hay que sacar esas asignaciones primero.
-
-### 3.3 Multitenancy
+### 3.1 Multitenancy
 
 Nos conectamos a Supabase con el usuario `postgres` por el pooler, así que **RLS no aplica**: el aislamiento lo hace el backend.
 - El JWT lleva `id_usuario`, `rol` e `id_empresa`.
@@ -302,21 +111,12 @@ Carpeta `api-eventos/database/`, numerados y en orden de ejecución (Supabase �
 | `04_artistas.sql` | `artistas` |
 | `05_eventos.sql` | `eventos`, `jornadas`, `evento_escenarios`, `presentaciones` |
 | `06_ventas.sql` | `tarifas`, `compras`, `entradas` |
-| `07_triggers.sql` | Validaciones de tenant y de fechas de jornada |
-| `08_vistas.sql` | `v_cartelera` (eventos publicados con lugar y headliners), `v_lugares` (con la capacidad total calculada), `v_disponibilidad` (por evento, jornada y espacio: capacidad − vendidas) |
+| `07_triggers.sql` | Los 5 triggers del DER (lugar válido, jornada en rango, presentación en jornada, mínimo un espacio, compras solo de clientes) |
+| `08_vistas.sql` | `v_cartelera` (eventos publicados con lugar y headliners), `v_lugares` (con la capacidad total calculada), `v_disponibilidad` (por evento, jornada y espacio: capacidad − vendidas), `v_recaudacion` (service charge por productora y mes) |
 | `10_seed_plataforma.sql` | Superadmin y **20 lugares predefinidos** con escenarios, espacios con capacidad y, en algunos, el plano dibujado |
 | `11_seed_demo.sql` | 3 productoras con usuarios, lugares y artistas propios, 1 festival de 3 días completo, 2 recitales y clientes con compras (con service charge) |
 
-Restricciones a incluir (lista de control):
-- `usuarios`: `CHECK ((rol = 'empresa') = (id_empresa IS NOT NULL))`, `CHECK (rol IN (...))`.
-- `escenarios`/`espacios`: `UNIQUE (id_lugar, nombre)` y `UNIQUE (id_x, id_lugar)` (las necesitan las FK compuestas).
-- `eventos`: `UNIQUE (id_evento, id_lugar)`, `CHECK (fecha_fin >= fecha_inicio)`, `CHECK estado IN (...)`.
-- `jornadas`: `UNIQUE (id_evento, fecha)`, `UNIQUE (id_jornada, id_evento)`.
-- `presentaciones`: `CHECK (fin > inicio)` y los dos `EXCLUDE USING gist (... tsrange(inicio, fin) WITH &&)`.
-- `tarifas`: `CHECK (precio >= 0)`, `CHECK (venta_hasta > venta_desde)`.
-- `empresas`: `CHECK (cargo_servicio_pct BETWEEN 0 AND 100)`. `compras`: `CHECK (total = subtotal + cargo_servicio)`.
-- `espacios.capacidad > 0`. No se puede borrar el último espacio de un lugar (trigger).
-- `elementos_plano`: `CHECK (tipo IN (...))`. `geometria`: `CHECK (geometria ? 'tipo')`, y la forma completa la valida zod en el backend.
+Las restricciones (CHECK, UNIQUE, FK compuestas, EXCLUDE, triggers) están listadas en [docs/der/DER.md](der/DER.md#4-restricciones-de-integridad).
 
 Lugares predefinidos propuestos (mezcla de Córdoba y del resto del país): Estadio Mario Alberto Kempes, Orfeo Superdomo,
 Quality Espacio, Plaza de la Música, Aeródromo Santa María de Punilla (Cosquín Rock), Estadio Monumental, La Bombonera,

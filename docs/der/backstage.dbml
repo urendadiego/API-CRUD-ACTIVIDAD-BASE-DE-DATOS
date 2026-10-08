@@ -1,0 +1,288 @@
+// Backstage — modelo lógico de datos (PostgreSQL)
+// Para ver el diagrama: pegar este archivo en https://dbdiagram.io/d  → Export → PNG / PDF
+// Detalle de reglas y justificación: docs/der/DER.md
+
+Project backstage {
+  database_type: 'PostgreSQL'
+  Note: 'Plataforma multitenant de productoras de recitales y festivales. Tenant = empresas.'
+}
+
+// ───────────────────────── Plataforma y usuarios ─────────────────────────
+
+Table empresas {
+  id_empresa serial [pk]
+  nombre varchar(150) [not null]
+  cuit varchar(13) [not null, unique]
+  email varchar(150)
+  telefono varchar(30)
+  direccion varchar(200)
+  logo_url varchar(300)
+  cargo_servicio_pct "numeric(5,2)" [not null, default: 10, note: 'Service charge que cobra la plataforma. CHECK 0..100. Lo define el superadmin']
+  activo boolean [not null, default: true]
+  fecha_creacion timestamp [not null, default: `now()`]
+  Note: 'Productoras (tenants)'
+}
+
+Table usuarios {
+  id_usuario serial [pk]
+  email varchar(150) [not null, unique]
+  password_hash varchar(100) [not null, note: 'bcrypt']
+  nombre varchar(100) [not null]
+  apellido varchar(100)
+  dni varchar(10)
+  telefono varchar(30)
+  rol varchar(15) [not null, note: "CHECK IN ('superadmin','empresa','cliente')"]
+  id_empresa int [note: 'Obligatorio si rol = empresa, NULL en los demás. CHECK ((rol = empresa) = (id_empresa IS NOT NULL))']
+  activo boolean [not null, default: true]
+  fecha_creacion timestamp [not null, default: `now()`]
+}
+
+// ───────────────────────── Lugares ─────────────────────────
+
+Table lugares {
+  id_lugar serial [pk]
+  id_empresa int [note: 'NULL = lugar de la plataforma (lo usan todas). Con valor = lugar propio y privado de esa productora']
+  nombre varchar(150) [not null]
+  tipo varchar(20) [not null, note: "CHECK IN ('estadio','arena','teatro','predio','club','otro')"]
+  direccion varchar(200) [not null]
+  ciudad varchar(100) [not null]
+  provincia varchar(100) [not null]
+  imagen_url varchar(300)
+  plano_ancho int [note: 'Tamaño del lienzo del plano. Ambos NULL (sin plano) o ambos > 0']
+  plano_alto int
+  activo boolean [not null, default: true]
+  fecha_creacion timestamp [not null, default: `now()`]
+
+  indexes {
+    (id_empresa, nombre) [unique, note: 'NULLS NOT DISTINCT: tampoco se repite el nombre dentro de la plataforma']
+  }
+  Note: 'La capacidad total NO se guarda: es SUM(espacios.capacidad), vista v_lugares'
+}
+
+Table escenarios {
+  id_escenario serial [pk]
+  id_lugar int [not null]
+  nombre varchar(100) [not null]
+  descripcion varchar(300)
+  geometria jsonb [note: 'Forma en el plano (opcional)']
+
+  indexes {
+    (id_lugar, nombre) [unique]
+    (id_escenario, id_lugar) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table espacios {
+  id_espacio serial [pk]
+  id_lugar int [not null]
+  nombre varchar(100) [not null, note: 'Platea, Campo, VIP...']
+  modalidad varchar(10) [not null, default: 'de_pie', note: "CHECK IN ('de_pie','sentado')"]
+  capacidad int [not null, note: 'CHECK > 0. Es el cupo vendible del sector']
+  color varchar(7) [note: '#RRGGBB para el plano']
+  geometria jsonb [note: 'Forma en el plano (opcional)']
+
+  indexes {
+    (id_lugar, nombre) [unique]
+    (id_espacio, id_lugar) [unique, note: 'Destino de FK compuesta']
+  }
+  Note: 'Todo lugar tiene al menos un espacio (trigger impide borrar el último)'
+}
+
+Table elementos_plano {
+  id_elemento serial [pk]
+  id_lugar int [not null]
+  tipo varchar(15) [not null, note: "CHECK IN ('cabina_dj','barra','banos','ingreso','mangrullo','otro')"]
+  etiqueta varchar(60)
+  geometria jsonb [not null]
+  Note: 'Referencias visuales del plano que no se venden'
+}
+
+// ───────────────────────── Programación ─────────────────────────
+
+Table artistas {
+  id_artista serial [pk]
+  id_empresa int [not null, note: 'Cada productora carga los suyos']
+  nombre varchar(150) [not null]
+  genero varchar(60)
+  pais varchar(60)
+  bio text
+  imagen_url varchar(300)
+  activo boolean [not null, default: true]
+  fecha_creacion timestamp [not null, default: `now()`]
+
+  indexes {
+    (id_empresa, nombre) [unique]
+    (id_artista, id_empresa) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table eventos {
+  id_evento serial [pk]
+  id_empresa int [not null]
+  id_lugar int [not null, note: 'Trigger: el lugar debe ser de la plataforma o de la misma empresa']
+  nombre varchar(150) [not null]
+  descripcion text
+  tipo varchar(10) [not null, note: "CHECK IN ('recital','festival')"]
+  fecha_inicio date [not null]
+  fecha_fin date [not null, note: 'CHECK fecha_fin >= fecha_inicio']
+  estado varchar(12) [not null, default: 'borrador', note: "CHECK IN ('borrador','publicado','agotado','cancelado','finalizado')"]
+  imagen_url varchar(300)
+  fecha_creacion timestamp [not null, default: `now()`]
+
+  indexes {
+    (id_evento, id_lugar) [unique, note: 'Destino de FK compuesta']
+    (id_evento, id_empresa) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table jornadas {
+  id_jornada serial [pk]
+  id_evento int [not null]
+  fecha date [not null, note: 'Trigger: entre fecha_inicio y fecha_fin del evento']
+  hora_apertura time
+  nombre varchar(60) [note: 'Día 1, Noche de cierre...']
+
+  indexes {
+    (id_evento, fecha) [unique]
+    (id_jornada, id_evento) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table evento_escenarios {
+  id_evento int [not null]
+  id_escenario int [not null]
+  id_lugar int [not null, note: 'Copia controlada: garantiza que el escenario sea del lugar del evento']
+
+  indexes {
+    (id_evento, id_escenario) [pk]
+  }
+  Note: 'Escenarios del lugar que habilita cada evento (N:M)'
+}
+
+Table presentaciones {
+  id_presentacion serial [pk]
+  id_evento int [not null]
+  id_empresa int [not null, note: 'Copia controlada: garantiza que el artista sea de la productora del evento']
+  id_jornada int [not null]
+  id_escenario int [not null]
+  id_artista int [not null]
+  inicio timestamp [not null]
+  fin timestamp [not null, note: 'CHECK fin > inicio']
+  headliner boolean [not null, default: false]
+
+  Note: '''
+  Un artista puede tener varias presentaciones en el mismo evento (distintas jornadas, o la misma jornada en distintos escenarios).
+  EXCLUDE USING gist (id_escenario WITH =, tsrange(inicio, fin) WITH &&)  → un escenario no tiene dos shows superpuestos
+  EXCLUDE USING gist (id_artista  WITH =, tsrange(inicio, fin) WITH &&)  → un artista no está en dos lugares a la vez
+  '''
+}
+
+// ───────────────────────── Ventas ─────────────────────────
+
+Table tarifas {
+  id_tarifa serial [pk]
+  id_evento int [not null]
+  id_lugar int [not null, note: 'Copia controlada: garantiza que el espacio sea del lugar del evento']
+  id_espacio int [not null]
+  id_jornada int [note: 'NULL = abono (vale para todas las jornadas)']
+  nombre varchar(60) [not null, note: 'General, Preventa 1...']
+  precio "numeric(12,2)" [not null, note: 'CHECK >= 0']
+  venta_desde timestamp
+  venta_hasta timestamp [note: 'CHECK venta_hasta > venta_desde']
+  activa boolean [not null, default: true]
+
+  indexes {
+    (id_evento, id_espacio, id_jornada, nombre) [unique, note: 'NULLS NOT DISTINCT']
+    (id_tarifa, id_evento) [unique, note: 'Destino de FK compuesta']
+  }
+  Note: 'Sin cupo propio: el cupo es espacios.capacidad, compartido por todas las tarifas del espacio'
+}
+
+Table compras {
+  id_compra serial [pk]
+  id_usuario int [not null, note: 'Trigger: el usuario debe tener rol cliente']
+  id_evento int [not null]
+  fecha timestamp [not null, default: `now()`]
+  subtotal "numeric(12,2)" [not null, note: 'Para la productora']
+  cargo_servicio_pct "numeric(5,2)" [not null, note: 'Copia histórica del % vigente al comprar']
+  cargo_servicio "numeric(12,2)" [not null, note: 'Para la plataforma']
+  total "numeric(12,2)" [not null, note: 'CHECK total = subtotal + cargo_servicio']
+  medio_pago varchar(15) [not null, note: "CHECK IN ('credito','debito','transferencia') — simulado"]
+  referencia_pago varchar(40) [note: 'Id de transacción ficticio']
+  estado varchar(10) [not null, default: 'pendiente', note: "CHECK IN ('pendiente','pagada','rechazada','cancelada')"]
+
+  indexes {
+    (id_compra, id_evento) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table entradas {
+  id_entrada serial [pk]
+  id_compra int [not null]
+  id_evento int [not null, note: 'Copia controlada: la tarifa es del mismo evento que la compra']
+  id_tarifa int [not null]
+  codigo uuid [not null, unique, default: `gen_random_uuid()`, note: 'Se muestra como QR']
+  precio_pagado "numeric(12,2)" [not null]
+  estado varchar(8) [not null, default: 'valida', note: "CHECK IN ('valida','usada','anulada')"]
+  fecha_uso timestamp [note: 'CHECK (estado = usada) = (fecha_uso IS NOT NULL)']
+}
+
+// ───────────────────────── Relaciones ─────────────────────────
+
+Ref: usuarios.id_empresa > empresas.id_empresa [delete: restrict]
+Ref: lugares.id_empresa > empresas.id_empresa [delete: restrict]
+Ref: artistas.id_empresa > empresas.id_empresa [delete: restrict]
+Ref: eventos.id_empresa > empresas.id_empresa [delete: restrict]
+
+Ref: escenarios.id_lugar > lugares.id_lugar [delete: cascade]
+Ref: espacios.id_lugar > lugares.id_lugar [delete: cascade]
+Ref: elementos_plano.id_lugar > lugares.id_lugar [delete: cascade]
+Ref: eventos.id_lugar > lugares.id_lugar [delete: restrict]
+
+Ref: jornadas.id_evento > eventos.id_evento [delete: cascade]
+
+Ref: evento_escenarios.(id_evento, id_lugar) > eventos.(id_evento, id_lugar) [delete: cascade, update: cascade]
+Ref: evento_escenarios.(id_escenario, id_lugar) > escenarios.(id_escenario, id_lugar) [delete: restrict]
+
+Ref: presentaciones.(id_evento, id_empresa) > eventos.(id_evento, id_empresa) [delete: cascade]
+Ref: presentaciones.(id_jornada, id_evento) > jornadas.(id_jornada, id_evento) [delete: cascade]
+Ref: presentaciones.(id_evento, id_escenario) > evento_escenarios.(id_evento, id_escenario) [delete: cascade]
+Ref: presentaciones.(id_artista, id_empresa) > artistas.(id_artista, id_empresa) [delete: restrict]
+
+Ref: tarifas.(id_evento, id_lugar) > eventos.(id_evento, id_lugar) [delete: cascade, update: cascade]
+Ref: tarifas.(id_espacio, id_lugar) > espacios.(id_espacio, id_lugar) [delete: restrict]
+Ref: tarifas.(id_jornada, id_evento) > jornadas.(id_jornada, id_evento) [delete: cascade]
+
+Ref: compras.id_usuario > usuarios.id_usuario [delete: restrict]
+Ref: compras.id_evento > eventos.id_evento [delete: restrict]
+
+Ref: entradas.(id_compra, id_evento) > compras.(id_compra, id_evento) [delete: cascade]
+Ref: entradas.(id_tarifa, id_evento) > tarifas.(id_tarifa, id_evento) [delete: restrict]
+
+// ───────────────────────── Agrupación visual ─────────────────────────
+
+TableGroup plataforma {
+  empresas
+  usuarios
+}
+
+TableGroup lugares_y_plano {
+  lugares
+  escenarios
+  espacios
+  elementos_plano
+}
+
+TableGroup programacion {
+  artistas
+  eventos
+  jornadas
+  evento_escenarios
+  presentaciones
+}
+
+TableGroup ventas {
+  tarifas
+  compras
+  entradas
+}
