@@ -2,3 +2,6 @@
 **/dist
 **/.env
 .git
+engram-main
+.engram
+docs
