@@ -3,6 +3,7 @@
 Plataforma multitenant para **productoras de recitales y festivales**.
 Este documento define el dominio, el DER, los perfiles de usuario, la API, el front y el orden de trabajo.
 Es la referencia del grupo: si algo cambia, se cambia acá primero.
+El dominio del negocio (actores, procesos, reglas) está en [DOMINIO.md](DOMINIO.md), y el modelo de datos en [der/DER.md](der/DER.md).
 
 ---
 
@@ -83,11 +84,11 @@ que se pinta según la disponibilidad.
 El modelo de datos completo está en **[docs/der/DER.md](der/DER.md)** (entidades, cardinalidades, restricciones, reglas de borrado, normalización)
 y en **[docs/der/backstage.dbml](der/backstage.dbml)** (para ver y exportar el diagrama en dbdiagram.io).
 
-Resumen: 14 tablas en 4 grupos.
+Resumen: 15 tablas en 4 grupos.
 - **Plataforma:** empresas, usuarios
 - **Lugares y plano:** lugares, escenarios, espacios, elementos_plano
 - **Programación:** artistas, eventos, jornadas, evento_escenarios, presentaciones
-- **Ventas:** tarifas, compras, entradas
+- **Ventas y acceso:** tarifas, compras, entradas, ingresos
 
 ### 3.1 Multitenancy
 
@@ -110,8 +111,8 @@ Carpeta `api-eventos/database/`, numerados y en orden de ejecución (Supabase �
 | `03_lugares.sql` | `lugares`, `escenarios`, `espacios`, `elementos_plano` |
 | `04_artistas.sql` | `artistas` |
 | `05_eventos.sql` | `eventos`, `jornadas`, `evento_escenarios`, `presentaciones` |
-| `06_ventas.sql` | `tarifas`, `compras`, `entradas` |
-| `07_triggers.sql` | Los 5 triggers del DER (lugar válido, jornada en rango, presentación en jornada, mínimo un espacio, compras solo de clientes) |
+| `06_ventas.sql` | `tarifas`, `compras`, `entradas`, `ingresos` |
+| `07_triggers.sql` | Los 6 triggers del DER (lugar válido, jornada en rango, presentación en jornada, mínimo un espacio, compras solo de clientes, ingresos válidos) |
 | `08_vistas.sql` | `v_cartelera` (eventos publicados con lugar y headliners), `v_lugares` (con la capacidad total calculada), `v_disponibilidad` (por evento, jornada y espacio: capacidad − vendidas), `v_recaudacion` (service charge por productora y mes) |
 | `10_seed_plataforma.sql` | Superadmin y **20 lugares predefinidos** con escenarios, espacios con capacidad y, en algunos, el plano dibujado |
 | `11_seed_demo.sql` | 3 productoras con usuarios, lugares y artistas propios, 1 festival de 3 días completo, 2 recitales y clientes con compras (con service charge) |
@@ -187,7 +188,7 @@ src/
   - `eventos/:id/disponibilidad` GET (capacidad, vendidas y libres por jornada y espacio)
   - `PATCH eventos/:id/estado` → publicar exige al menos 1 jornada, 1 presentación y 1 tarifa
   - `eventos/:id/ventas` GET con un resumen
-- `POST /entradas/validar` → recibe un `codigo` y marca la entrada como usada (control de acceso).
+- `POST /entradas/validar` → recibe un `codigo` y registra el ingreso de la entrada en la jornada (control de acceso).
 
 **Cliente** (`/api/cliente`)
 - `GET /compras/cotizar` → devuelve subtotal, service charge y total antes de pagar.

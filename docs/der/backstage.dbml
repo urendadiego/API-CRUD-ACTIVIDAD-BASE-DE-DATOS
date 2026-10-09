@@ -223,8 +223,24 @@ Table entradas {
   id_tarifa int [not null]
   codigo uuid [not null, unique, default: `gen_random_uuid()`, note: 'Se muestra como QR']
   precio_pagado "numeric(12,2)" [not null]
-  estado varchar(8) [not null, default: 'valida', note: "CHECK IN ('valida','usada','anulada')"]
-  fecha_uso timestamp [note: 'CHECK (estado = usada) = (fecha_uso IS NOT NULL)']
+  estado varchar(8) [not null, default: 'valida', note: "CHECK IN ('valida','anulada'). Si fue usada se sabe por ingresos"]
+
+  indexes {
+    (id_entrada, id_evento) [unique, note: 'Destino de FK compuesta']
+  }
+}
+
+Table ingresos {
+  id_ingreso serial [pk]
+  id_entrada int [not null]
+  id_evento int [not null, note: 'Copia controlada: la jornada es del mismo evento que la entrada']
+  id_jornada int [not null, note: 'Trigger: si la tarifa es de un día, tiene que ser esa jornada; si es abono, cualquiera']
+  fecha_hora timestamp [not null, default: `now()`]
+
+  indexes {
+    (id_entrada, id_jornada) [unique, note: 'Un ingreso por entrada y jornada: la entrada de un día entra una vez, el abono una vez por día']
+  }
+  Note: 'Control de acceso: cada escaneo válido del QR en la puerta'
 }
 
 // ───────────────────────── Relaciones ─────────────────────────
@@ -259,6 +275,9 @@ Ref: compras.id_evento > eventos.id_evento [delete: restrict]
 Ref: entradas.(id_compra, id_evento) > compras.(id_compra, id_evento) [delete: cascade]
 Ref: entradas.(id_tarifa, id_evento) > tarifas.(id_tarifa, id_evento) [delete: restrict]
 
+Ref: ingresos.(id_entrada, id_evento) > entradas.(id_entrada, id_evento) [delete: cascade]
+Ref: ingresos.(id_jornada, id_evento) > jornadas.(id_jornada, id_evento) [delete: restrict]
+
 // ───────────────────────── Agrupación visual ─────────────────────────
 
 TableGroup plataforma {
@@ -285,4 +304,5 @@ TableGroup ventas {
   tarifas
   compras
   entradas
+  ingresos
 }

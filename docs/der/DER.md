@@ -41,6 +41,8 @@ erDiagram
     EVENTOS   ||--o{ COMPRAS : "se compra en"
     COMPRAS   ||--|{ ENTRADAS : genera
     TARIFAS   ||--o{ ENTRADAS : "se emite con"
+    ENTRADAS  ||--o{ INGRESOS : "registra"
+    JORNADAS  ||--o{ INGRESOS : "en"
 
     EMPRESAS {
         serial id_empresa PK
@@ -184,7 +186,13 @@ erDiagram
         uuid codigo UK
         numeric precio_pagado
         varchar estado
-        timestamp fecha_uso
+    }
+    INGRESOS {
+        serial id_ingreso PK
+        int id_entrada FK
+        int id_evento FK
+        int id_jornada FK
+        timestamp fecha_hora
     }
 ```
 
@@ -210,6 +218,7 @@ erDiagram
 | **tarifas** | Precio de un sector para una jornada o para el abono | productora |
 | **compras** | Operación de pago (simulado) de un cliente, con el service charge | cliente |
 | **entradas** | Cada entrada emitida en una compra, con su código QR | sistema (al pagar) |
+| **ingresos** | Cada vez que una entrada entra por la puerta en una jornada (control de acceso) | productora (al escanear) |
 
 ---
 
@@ -233,6 +242,8 @@ erDiagram
 | eventos — compras | 1 : 0..N | Una compra es de un solo evento |
 | compras — entradas | 1 : 1..N | Una compra genera una o más entradas |
 | tarifas — entradas | 1 : 0..N | Cada entrada se emite con una tarifa |
+| entradas — ingresos | 1 : 0..N | Una entrada de un día tiene como máximo 1 ingreso; un abono, 1 por jornada |
+| jornadas — ingresos | 1 : 0..N | Cada ingreso es en una jornada |
 
 ### 3.1 Casos del dominio y cómo se resuelven
 
@@ -251,6 +262,7 @@ erDiagram
 | Entrada por día o **abono** | `tarifas.id_jornada` con valor = un día; `NULL` = abono de todas las jornadas |
 | El **cupo** de un sector | `espacios.capacidad`. Varias tarifas del mismo sector comparten ese cupo |
 | La productora usa lugares **de la plataforma o propios** | Trigger en `eventos` (una FK no alcanza porque `id_empresa` del lugar puede ser NULL) |
+| Un **abono** entra una vez **por día**, una entrada común una sola vez | Tabla `ingresos` con `UNIQUE (id_entrada, id_jornada)` y trigger que exige que la entrada de un día solo ingrese en su jornada |
 | Service charge con historial | `compras` guarda el `%` aplicado y los importes: si después cambia el % de la productora, las compras viejas no cambian |
 
 ---
@@ -276,7 +288,7 @@ erDiagram
 | presentaciones | `fin > inicio` (más los dos `EXCLUDE`) |
 | tarifas | `precio >= 0`, `venta_hasta > venta_desde` |
 | compras | `total = subtotal + cargo_servicio`, `medio_pago IN (...)`, `estado IN (...)` |
-| entradas | `estado IN ('valida','usada','anulada')`, `(estado = 'usada') = (fecha_uso IS NOT NULL)` |
+| entradas | `estado IN ('valida','anulada')`. Si una entrada "fue usada" se sabe por `ingresos`, no se guarda en la entrada |
 | geometrías (jsonb) | `geometria ? 'tipo'`. La forma completa la valida el backend |
 
 ### 4.3 Triggers (lo que no se puede expresar con FK ni CHECK)
@@ -287,6 +299,7 @@ erDiagram
 | `presentacion_en_jornada` | `inicio` cae el día de la jornada o en la madrugada del siguiente (shows después de medianoche) |
 | `espacios_minimo_uno` | No se puede borrar el último espacio de un lugar, salvo que se esté borrando el lugar entero |
 | `compras_solo_clientes` | `compras.id_usuario` tiene que tener rol `cliente` |
+| `ingresos_validos` | La entrada está `valida`, y si su tarifa es de un día, el ingreso es en esa jornada |
 
 ### 4.4 Lo que valida el backend
 - Que no se venda por encima de la capacidad: al comprar, en una transacción con `SELECT … FOR UPDATE` sobre las tarifas del evento y el espacio.
@@ -307,6 +320,8 @@ erDiagram
 | escenarios → evento_escenarios / espacios → tarifas | RESTRICT | No se borra un escenario o un sector que se está usando |
 | artistas → presentaciones | RESTRICT | Baja lógica (`activo = false`) |
 | compras → entradas | CASCADE | Las entradas son parte de la compra |
+| entradas → ingresos | CASCADE | Los ingresos son parte de la entrada |
+| jornadas → ingresos | RESTRICT | No se borra una jornada en la que ya entró gente |
 | tarifas → entradas | RESTRICT | No se borra una tarifa con entradas vendidas |
 
 `ON UPDATE CASCADE` en `(id_evento, id_lugar)`: si se cambia el lugar de un evento que ya tiene escenarios o tarifas, el cambio se propaga
@@ -319,7 +334,7 @@ a esas filas. Como el escenario o el espacio no existe en el lugar nuevo, la FK 
 El modelo está en **3FN**. Cada atributo depende de la clave, de toda la clave y de nada más que la clave. Hay tres puntos que parecen
 redundancia y no lo son:
 
-1. **Copias controladas** (`id_lugar` en `evento_escenarios` y `tarifas`, `id_empresa` en `presentaciones`, `id_evento` en `entradas`).
+1. **Copias controladas** (`id_lugar` en `evento_escenarios` y `tarifas`, `id_empresa` en `presentaciones`, `id_evento` en `entradas` e `ingresos`).
    Son parte de una FK compuesta, así que la base **garantiza** que coincidan con el padre: no puede haber una anomalía de actualización.
    Permiten expresar reglas de negocio con FK en lugar de triggers.
 2. **Datos históricos** (`compras.cargo_servicio_pct`, `compras.subtotal`/`total`, `entradas.precio_pagado`). No son derivados:
@@ -329,4 +344,5 @@ redundancia y no lo son:
    - `v_lugares`: lugar con `SUM(espacios.capacidad)`
    - `v_disponibilidad`: por evento, jornada y espacio = capacidad − entradas válidas (las de abono cuentan en todas las jornadas)
    - `v_cartelera`: eventos publicados con lugar, fechas y headliners
+   - `v_asistencia`: por evento y jornada, entradas vendidas vs. ingresos
    - `v_recaudacion`: service charge por productora y por mes (para el superadmin)
