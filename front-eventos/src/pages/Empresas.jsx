@@ -22,6 +22,7 @@ function Empresas() {
     const cargarEmpresas = async () => {
       try {
         const response = await obtenerEmpresas();
+        if (!Array.isArray(response.data)) throw new Error("Respuesta inesperada de la API");
         setEmpresas(response.data);
       } catch {
         setError("No se pudieron cargar las empresas");
